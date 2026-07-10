@@ -274,7 +274,11 @@ public final class BlePresentationService: @unchecked Sendable, PresentationServ
 	public func sendResponse(userAccepted: Bool, itemsToSend: RequestItems, deviceNameSpacesToSend: RequestDeviceNameSpaces? = nil, onSuccess: (@Sendable (URL?) -> Void)?) async throws  {
 		await handleSelected?(userAccepted, itemsToSend, deviceNameSpacesToSend)
 		handleSelected = nil
-		TransactionLogUtils.setCborTransactionLogResponseInfo(self, transactionLog: &transactionLog)
+		// documentIds is populated by userSelected after a successful response build.
+		// docType and displayName are not available on this service; they are populated by the
+		// PresentationSession caller which has access to docIdToPresentInfo.
+		let firstDocId = documentIds.first
+		TransactionLogUtils.setCborTransactionLogResponseInfo(self, documentId: firstDocId, docType: nil, displayName: nil, transactionLog: &transactionLog)
 	}
 	
 	public func waitForDisconnect() async throws {

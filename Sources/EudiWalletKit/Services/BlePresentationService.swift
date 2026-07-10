@@ -277,8 +277,9 @@ public final class BlePresentationService: @unchecked Sendable, PresentationServ
 		// documentIds is populated by userSelected after a successful response build.
 		// docType and displayName are not available on this service; they are populated by the
 		// PresentationSession caller which has access to docIdToPresentInfo.
-		let firstDocId = documentIds.first
-		TransactionLogUtils.setCborTransactionLogResponseInfo(self, documentId: firstDocId, docType: nil, displayName: nil, transactionLog: &transactionLog)
+let firstDocId = documentIds.first
+let firstDocType = firstDocId.flatMap { docs[$0]?.issuerAuth.mso.docType }
+TransactionLogUtils.setCborTransactionLogResponseInfo(self, documentId: firstDocId, docType: firstDocType, displayName: nil, transactionLog: &transactionLog)
 	}
 	
 	public func waitForDisconnect() async throws {

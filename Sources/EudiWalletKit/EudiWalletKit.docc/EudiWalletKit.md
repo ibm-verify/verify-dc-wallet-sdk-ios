@@ -37,6 +37,8 @@ The library depends on the following EUDI libraries:
 - <doc:IssueDocuments>
 - <doc:SecureAreas>
 - <doc:PresentationService>
+- <doc:RegistrationCertificate>
+- <doc:TrustMark>
 
 @Links(visualStyle: detailedGrid) {
 	- <doc:WalletUI>

@@ -17,17 +17,25 @@ Created on 09/11/2023
 */
 import Foundation
 import OpenID4VCI
+import struct OpenID4VP.ClaimPath
 import MdocDataModel18013
 import MdocSecurity18013
 import WalletStorage
 import SwiftCBOR
 import SwiftyJSON
 import JOSESwift
+import JSONWebSignature
 import protocol JSONWebAlgorithms.JWKRepresentable
 import struct JSONWebAlgorithms.SecKeyExtended
 import struct JSONWebKey.JWK
+import protocol OpenID4VCI.Networking
 import struct eudi_lib_sdjwt_swift.ClaimPath
 import eudi_lib_sdjwt_swift
+import struct OpenID4VP.RegistrationCertificatePolicy
+import struct OpenID4VP.DCQL
+import typealias OpenID4VP.CertificateTrust
+import enum OpenID4VP.Authorization
+import struct OpenID4VP.PolicyViolation
 
 extension String {
 	public func translated() -> String {
@@ -48,7 +56,6 @@ func resolveProofTypeAttestationSupport(proofTypesSupported: [String: ProofTypeS
 	jwtProofTypeKeyAttestationRequirement: KeyAttestationRequirement?,
 	attestProofTypeKeyAttestationRequirement: KeyAttestationRequirement?,
 	supportsAttestationProofType: Bool,
-	supportsJwtProofTypeWithoutAttestation: Bool,
 	supportsJwtProofTypeWithAttestation: Bool
 ) {
 	let jwtProofType = proofTypesSupported["jwt"]
@@ -56,14 +63,12 @@ func resolveProofTypeAttestationSupport(proofTypesSupported: [String: ProofTypeS
 	let jwtProofTypeKeyAttestationRequirement = jwtProofType?.keyAttestationRequirement
 	let attestProofTypeKeyAttestationRequirement = attestProofType?.keyAttestationRequirement
 	let supportsAttestationProofType = attestProofType != nil && attestProofTypeKeyAttestationRequirement != .notRequired
-	let supportsJwtProofTypeWithoutAttestation = jwtProofType != nil && (jwtProofTypeKeyAttestationRequirement == nil || jwtProofTypeKeyAttestationRequirement == .notRequired)
-	let supportsJwtProofTypeWithAttestation = jwtProofType != nil && !supportsJwtProofTypeWithoutAttestation
+	let supportsJwtProofTypeWithAttestation = jwtProofType != nil && jwtProofTypeKeyAttestationRequirement != nil && jwtProofTypeKeyAttestationRequirement != .notRequired
 	return (
 		jwtProofType,
 		jwtProofTypeKeyAttestationRequirement,
 		attestProofTypeKeyAttestationRequirement,
 		supportsAttestationProofType,
-		supportsJwtProofTypeWithoutAttestation,
 		supportsJwtProofTypeWithAttestation
 	)
 }
@@ -107,13 +112,13 @@ extension FileManager {
 }
 
 extension Encodable {
-    /// Converting object to postable JSON
-    func toJSON(_ encoder: JSONEncoder = JSONEncoder()) -> [String: Any] {
-        guard let data = try? encoder.encode(self),
-              let object = try? JSONSerialization.jsonObject(with: data, options: .allowFragments),
-              let json = object as? [String: Any] else { return [:] }
-        return json
-    }
+	/// Converting object to postable JSON
+	func toJSON(_ encoder: JSONEncoder = JSONEncoder()) -> [String: Any] {
+		guard let data = try? encoder.encode(self),
+			  let object = try? JSONSerialization.jsonObject(with: data, options: .allowFragments),
+			  let json = object as? [String: Any] else { return [:] }
+		return json
+	}
 }
 
 extension WalletStorage.Document {
@@ -153,7 +158,7 @@ extension WalletStorage.Document {
 }
 
 extension MdocDataModel18013.CoseKey {
- 	static func x963Representation(x: Data, y: Data) -> Data {
+	static func x963Representation(x: Data, y: Data) -> Data {
 		var data = Data([0x04])
 		data.append(x)
 		data.append(y)
@@ -235,11 +240,11 @@ struct AuthorizedRequestData: Codable {
 }
 
 extension CredentialConfiguration {
-	func convertToDocMetadata(authorized: AuthorizedRequest? = nil, keyOptions: KeyOptions? = nil, credentialOptions: CredentialOptions? = nil, dpopKeyId: String? = nil) -> DocMetadata {
+	func convertToDocMetadata(authorized: AuthorizedRequest? = nil, keyOptions: KeyOptions? = nil, credentialOptions: CredentialOptions? = nil) -> DocMetadata {
 		let claimMetadata = claims.map(\.metadata)
 		let authorizedRequestData: Data? = if let authorized { try? JSONEncoder().encode(AuthorizedRequestData(from: authorized)) } else { nil }
 		let resolvedDocType = docType ?? vct ?? ""
-		return DocMetadata(credentialIssuerIdentifier: credentialIssuerIdentifier, configurationIdentifier: configurationIdentifier.value, docType: resolvedDocType, display: display, issuerDisplay: issuerDisplay, claims: claimMetadata, authorizedRequestData: authorizedRequestData, keyOptions: keyOptions, credentialOptions: credentialOptions, dpopKeyId: dpopKeyId)
+		return DocMetadata(credentialIssuerIdentifier: credentialIssuerIdentifier, configurationIdentifier: configurationIdentifier.value, docType: resolvedDocType, display: display, issuerDisplay: issuerDisplay, claims: claimMetadata, authorizedRequestData: authorizedRequestData, keyOptions: keyOptions, credentialOptions: credentialOptions)
 	}
 }
 
@@ -252,23 +257,23 @@ extension DocMetadata {
 	/// Downloads all remote images referenced in the credential `display` metadata and replaces their
 	/// URLs with inline `data:` URIs. This prevents issuers from learning when a user views a credential
 	/// (privacy) and eliminates network latency at display time. URLs that cannot be fetched are left unchanged.
-	func downloadingDisplayImages() async -> DocMetadata {
+	func downloadingDisplayImages(networking: any Networking) async -> DocMetadata {
 		guard let display, display.contains(where: { $0.backgroundImageURL != nil || $0.logo?.urlString != nil }) else { return self }
 		let downloadedDisplay = await withTaskGroup(of: DisplayMetadata.self) { group in
-			for dm in display { group.addTask { await dm.downloadingImages() } }
+			for dm in display { group.addTask { await dm.downloadingImages(networking: networking) } }
 			var result: [DisplayMetadata] = []
 			for await dm in group { result.append(dm) }
 			return result
 		}
-		return DocMetadata(credentialIssuerIdentifier: credentialIssuerIdentifier, configurationIdentifier: configurationIdentifier, docType: docType, display: downloadedDisplay, issuerDisplay: issuerDisplay, claims: claims, authorizedRequestData: authorizedRequestData, keyOptions: keyOptions, credentialOptions: credentialOptions, dpopKeyId: dpopKeyId)
+		return DocMetadata(credentialIssuerIdentifier: credentialIssuerIdentifier, configurationIdentifier: configurationIdentifier, docType: docType, display: downloadedDisplay, issuerDisplay: issuerDisplay, claims: claims, authorizedRequestData: authorizedRequestData, keyOptions: keyOptions, credentialOptions: credentialOptions)
 	}
 }
 
 extension DisplayMetadata {
 	/// Returns a copy of this `DisplayMetadata` with any http(s) image URLs replaced by inline `data:` URIs.
-	func downloadingImages() async -> DisplayMetadata {
-		async let newBgURL = Self.fetchAsDataURI(urlString: backgroundImageURL)
-		async let newLogoURL = Self.fetchAsDataURI(urlString: logo?.urlString)
+	func downloadingImages(networking: any Networking) async -> DisplayMetadata {
+		async let newBgURL = Self.fetchAsDataURI(urlString: backgroundImageURL, networking: networking)
+		async let newLogoURL = Self.fetchAsDataURI(urlString: logo?.urlString, networking: networking)
 		let (fetchedBg, fetchedLogo) = await (newBgURL, newLogoURL)
 		let newLogo = logo.map { LogoMetadata(urlString: fetchedLogo ?? $0.urlString, alternativeText: $0.alternativeText) }
 		let resolvedBackgroundImageURL = fetchedBg ?? backgroundImageURL
@@ -277,13 +282,13 @@ extension DisplayMetadata {
 
 	/// Downloads data from `urlString` (http/https only) and encodes it as a `data:` URI.
 	/// Returns `nil` if the URL is already a data URI, is `nil`, is non-http, or the download fails.
-	private static func fetchAsDataURI(urlString: String?) async -> String? {
+	private static func fetchAsDataURI(urlString: String?, networking: any Networking) async -> String? {
 		guard let urlString else { return nil }
 		// Already a data URI – nothing to do
 		if urlString.lowercased().hasPrefix("data:") { return nil }
 		guard let url = URL(string: urlString), url.scheme == "https" || url.scheme == "http" else { return nil }
 		do {
-			let (data, response) = try await URLSession.shared.data(from: url)
+			let (data, response) = try await networking.data(from: url)
 			let mimeType = (response as? HTTPURLResponse)?.mimeType ?? "application/octet-stream"
 			return "data:\(mimeType);base64,\(data.base64EncodedString())"
 		} catch {
@@ -295,10 +300,6 @@ extension DisplayMetadata {
 
 extension DocKeyInfo {
 	static var `default`: Self { DocKeyInfo(secureAreaName: SoftwareSecureArea.name, batchSize: 1, credentialPolicy: .rotateUse) }
-}
-
-extension IssueRequest {
-	var dpopKeyId: String { id + "_dpop" }
 }
 
 extension URL {
@@ -411,10 +412,7 @@ extension JSON {
 
 
 extension SecureAreaSigner: eudi_lib_sdjwt_swift.AsyncSignerProtocol {
-    func signAsync(_ data: Data) async throws -> Data {
-        return try await sign(data)
-    }
-
+	func signAsync(_ data: Data) async throws -> Data { try await sign(data) }
 }
 
 extension JSON {
@@ -498,10 +496,10 @@ class PrecomputedSigner: JOSESwift.SignerProtocol {
 
 
 extension DocClaim {
-	var claimPath: ClaimPath {
-		ClaimPath(path.map { if let index = Int($0) { ClaimPathElement.arrayElement(index: index) } else if $0.isEmpty { ClaimPathElement.allArrayElements } else { ClaimPathElement.claim(name: $0) } })
+	var claimPath: eudi_lib_sdjwt_swift.ClaimPath {
+		eudi_lib_sdjwt_swift.ClaimPath(path.map { if let index = Int($0) { ClaimPathElement.arrayElement(index: index) } else if $0.isEmpty { ClaimPathElement.allArrayElements } else { ClaimPathElement.claim(name: $0) } })
 	}
-	var claimPaths: [ClaimPath] {
+	var claimPaths: [eudi_lib_sdjwt_swift.ClaimPath] {
 		if let children { children.map(\.claimPath) } else { [claimPath] }
 	}
 }
@@ -514,7 +512,7 @@ extension DocClaimsModelConfiguration {
 			credentialIssuerIdentifier: model.credentialIssuerIdentifier,
 			configurationIdentifier: model.configurationIdentifier,
 			validFrom: model.validFrom, validUntil: model.validUntil,
-			statusIdentifier: model.statusIdentifier,
+			statusList: model.statusList,
 			credentialsUsageCounts: model.credentialsUsageCounts,
 			credentialPolicy: model.credentialPolicy, secureAreaName: model.secureAreaName,
 			modifiedAt: model.modifiedAt, ageOverXX: model.ageOverXX,
@@ -530,7 +528,7 @@ extension DocClaimsModelConfiguration {
 			credentialIssuerIdentifier: credentialIssuerIdentifier,
 			configurationIdentifier: configurationIdentifier,
 			validFrom: validFrom, validUntil: validUntil,
-			statusIdentifier: statusIdentifier,
+			statusList: statusList,
 			credentialsUsageCounts: credentialsUsageCounts,
 			credentialPolicy: credentialPolicy, secureAreaName: secureAreaName,
 			modifiedAt: modifiedAt, ageOverXX: ageOverXX,
@@ -561,7 +559,7 @@ extension SigningKeyProxy: @retroactive JWKRepresentable {
 			return try! signer.publicKey.toJsonWebKeyJWK()
 		}
 	}
-	
+
 	/// get the public JWK key
 	public func getPublicJWK() throws -> any JOSESwift.JWK {
 		switch self {
@@ -593,15 +591,80 @@ extension JOSESwift.JWK {
 	}
 }
 
+extension CredentialOfferRequest {
+	func recoverMetadataError(
+		from resolverError: Error,
+		policy: IssuerMetadataPolicy,
+		fetcher: Fetcher<CredentialOfferRequestObject>,
+		metadataResolver: CredentialIssuerMetadataResolver
+	) async -> Error {
+		guard Self.isDiscardedMetadataError(resolverError) else { return resolverError }
+		do {
+			let requestObject: CredentialOfferRequestObject
+			switch self {
+			case .passByValue(let metadata):
+				guard let parsed = CredentialOfferRequestObject(jsonString: metadata) else {
+					return resolverError
+				}
+				requestObject = parsed
+			case .fetchByReference(let url):
+				switch await fetcher.fetch(url: url) {
+				case .success(let fetched):
+					requestObject = fetched
+				case .failure:
+					return resolverError
+				}
+			}
+			let issuerId = try CredentialIssuerId(requestObject.credentialIssuer)
+			switch try await metadataResolver.resolve(source: .credentialIssuer(issuerId), policy: policy) {
+			case .success:
+				return resolverError
+			case .failure(let error):
+				return error
+			}
+		} catch {
+			return error
+		}
+	}
+
+	static func metadataErrorDescription(for error: Error) -> String {
+		guard let error = error as? CredentialIssuerMetadataError else {
+			return error.localizedDescription
+		}
+		switch error {
+		case .unableToFetchCredentialIssuerMetadata(let cause):
+			return "Unable to fetch credential issuer metadata: \(cause.localizedDescription)"
+		case .missingSignedMetadata:
+			return "Credential issuer metadata is not signed"
+		case .missingContentType(let reason):
+			return reason
+		case .missingRightContentTypeHeader:
+			return "Credential issuer metadata has an invalid Content-Type"
+		case .invalidSignedMetadata(let reason):
+			return "Invalid signed credential issuer metadata: \(reason)"
+		case .invalidIssuerTrust:
+			return "Credential issuer metadata is not issued by a trusted issuer"
+		default:
+			return String(describing: error)
+		}
+	}
+
+	private static func isDiscardedMetadataError(_ error: Error) -> Bool {
+		// In eudi-lib-ios-openid4vci-swift, CredentialOfferRequestResolver.resolve(source:policy:) discards the resolver's error:
+		guard case .error(let reason) = error as? ValidationError else { return false }
+		return reason == "Invalid credential metadata"
+	}
+}
+
 extension EudiWallet {
 	/// Try to resolve a pre-registered VCI service directly from credential offer URL parameters.
-	func resolveVCIServiceFromOfferUri(_ offerUri: String) async -> OpenId4VciService? {
+	public func resolveVCIServiceFromOfferUri(_ offerUri: String) async -> OpenId4VciService? {
 		guard let issuerURL = Self.extractCredentialIssuerURL(from: offerUri) else { return nil }
 		return await OpenId4VCIServiceRegistry.shared.getByIssuerURL(issuerURL: issuerURL)
 	}
 
 	/// Extract credential issuer URL from an OpenID4VCI offer URL.
-	static func extractCredentialIssuerURL(from offerUri: String) -> String? {
+	public static func extractCredentialIssuerURL(from offerUri: String) -> String? {
 		guard let components = URLComponents(string: offerUri) else { return nil }
 		guard let encodedOffer = components.queryItems?.first(where: { $0.name == "credential_offer" })?.value else {
 			return nil
@@ -615,4 +678,49 @@ extension EudiWallet {
 		}
 		return credentialIssuer
 	}
+}
+
+extension OpenID4VP.ClaimPath {
+	var mdocClaimPath: MdocDataModel18013.ClaimPath {
+		MdocDataModel18013.ClaimPath(value.map { element in
+			switch element {
+			case .claim(let name): return .claim(name: name)
+			case .arrayElement(let index): return .arrayElement(index: index)
+			case .allArrayElements: return .allArrayElements
+			}
+		})
+	}
+}
+
+extension MdocDataModel18013.ClaimPath {
+	/// Converts a model claim path while preserving names, array indices, and wildcards.
+	var openID4VPClaimPath: OpenID4VP.ClaimPath {
+		OpenID4VP.ClaimPath(value.map { element in
+			switch element {
+			case .claim(let name): return .claim(name: name)
+			case .arrayElement(let index): return .arrayElement(index: index)
+			case .allArrayElements: return .allArrayElements
+			}
+		})
+	}
+}
+
+// MARK: - DCQL Policy Validation
+
+extension RegistrationCertificatePolicy {
+
+	/// Creates a default policy that validates certificate trust and checks
+	/// that the request DCQL does not exceed the scope declared in the WRPRC.
+	/// - Parameters:
+	///   - certificateTrust: The trust validator for the WRPRC signing certificate
+	///   - policyDcql: A closure that extracts the permitted DCQL scope from the WRPRC
+	/// - Returns: A policy that warns when the request DCQL is a superset of the policy DCQL
+	static func `default`(validator: WrpVpRegistrationValidator) -> RegistrationCertificatePolicy {
+	  RegistrationCertificatePolicy(
+		validatePolicy: { wrpac, wrprc, dcql in
+			return await validator.validateCertificate(wrpac: wrpac, wrprc: wrprc, dcql: dcql)
+		}
+	  )
+	}
+
 }

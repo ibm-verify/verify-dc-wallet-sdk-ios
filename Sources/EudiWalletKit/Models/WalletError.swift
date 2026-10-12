@@ -43,6 +43,8 @@ public struct WalletError: LocalizedError {
 		case trustError
 		/// invalid status token
 		case invalidStatusToken
+		/// status check failed
+		case statusCheckFailed
 		/// Credential offer could not be resolved
 		case offerResolutionFailed
 		/// Issuer metadata could not be resolved
@@ -55,6 +57,8 @@ public struct WalletError: LocalizedError {
 		case issuanceRequestFailed
 		/// The DCQL/VP query resolution was invalid
 		case invalidQueryResolution
+		/// OpenID4VP not secured request
+		case notSecuredRequest
 		/// Response encryption specification missing for directPostJWT
 		case responseEncryptionMissing
 		/// Invalid service name or parameters
@@ -65,7 +69,15 @@ public struct WalletError: LocalizedError {
 		case unsupportedAlgorithm
 		/// Storage operation failed
 		case storageError
-		/// Internal / unexpected error that does not fit another category
+		/// Missing VCI configuration
+		case missingVciConfiguration
+		/// Unsupportted credential configuration
+		case unsupportedCredentialConfiguration
+		/// no client attestation algorithm found
+		case noClientAttestationAlgorithmFound
+		/// invalid Wrprc
+		case invalidWrprc
+		// internal error
 		case internalError
 	}
 

@@ -17,69 +17,80 @@
 import Foundation
 import MdocDataModel18013
 import MdocSecurity18013
-import EudiEtsi1196x2
+import Security
 import StatiumSwift
-import JSONWebSignature
 import SwiftCBOR
+import JSONWebSignature
 import Logging
+import struct MdocDataModel18013.StatusList
 
 public actor DocumentStatusService {
-	let statusIdentifier: StatusIdentifier
+	let statusList: StatusList
 	/// Trust configuration used to validate the reader/relying-party access certificate chain.
 	public let trustConfig: TrustConfiguration
-	let date: Date?
+	let dateProvider: @Sendable () -> Date
 	private static let logger = Logger(label: "DocumentStatusService")
 
-	public init(statusIdentifier: StatusIdentifier, date: Date = .now, trustConfig: TrustConfiguration) {
-		self.statusIdentifier = statusIdentifier
+	/// Supplies a fresh validation time for each status check by default.
+	public init(statusList: StatusList, dateProvider: @escaping @Sendable () -> Date = { Date() }, trustConfig: TrustConfiguration) {
+		self.statusList = statusList
 		self.trustConfig = trustConfig
-		self.date = date
+		self.dateProvider = dateProvider
+	}
+
+	/// Uses a fixed validation time, for callers that explicitly supply a date.
+	public init(statusList: StatusList, date: Date, trustConfig: TrustConfiguration) {
+		self.init(statusList: statusList, dateProvider: { date }, trustConfig: trustConfig)
 	}
 
 	public func getStatus() async throws -> CredentialStatus {
-		guard let statusReference: StatusReference = .init(idx: statusIdentifier.idx, uriString: statusIdentifier.uriString) else {
+		guard let statusReference: StatusReference = .init(idx: statusList.idx, uriString: statusList.uri) else {
 			throw WalletError(description: "Invalid status identifier", code: .invalidStatusToken)
 		}
 		let getStatus = GetStatus()
 		let tokenFetcher = StatusListTokenFetcher(
-			verifier: VerifyStatusListTokenSignatureWithTrustManager(trustConfig: trustConfig)
+			verifier: StatusListTokenSignatureVerifier(trustConfig: trustConfig),
+			dateProvider: dateProvider
 		)
-		let result = try await getStatus.getStatus(index: statusReference.idx, url: statusReference.uri, fetchClaims: tokenFetcher.getStatusClaims, clockSkew: trustConfig.clockSkew).get()
-		return result
+		let result = await getStatus.getStatus(index: statusReference.idx, url: statusReference.uri, fetchClaims: tokenFetcher.getStatusClaims, clockSkew: trustConfig.clockSkew)
+		switch result {
+			case .success(let status): return status
+			case .failure(let error): throw WalletError(description: "Status check failed", code: .statusCheckFailed, innerError: error)
+		}
 	}
 }
 
-struct VerifyStatusListTokenSignatureWithTrustManager: VerifyStatusListTokenSignature {
-	public let trustConfig: TrustConfiguration
-	private static let logger = Logger(label: "VerifyStatusListTokenSignatureWithTrustManager")
+struct StatusListTokenSignatureVerifier: VerifyStatusListTokenSignature {
+	let trustConfig: TrustConfiguration
+	private static let logger = Logger(label: "StatusListTokenSignatureVerifier")
 
 	func verify(statusListToken: Data, format: StatusListTokenFormat, at: Date) async throws {
-		let certsData: [Data]
-		switch format {
-		case .jwt:
-			guard let jwtString = String(data: statusListToken, encoding: .utf8) else { throw JWS.JWSError.invalidString }
-			try x5cVerifyJwtSignature.verify(jwt: jwtString)
-			let jws = try JWS(jwsString: jwtString)
-			guard let b64certs = jws.protectedHeader.x509CertificateChain else { throw JWS.JWSError.somethingWentWrong }
-			certsData = b64certs.compactMap { Data(base64Encoded: $0) }
-			guard certsData.count == b64certs.count else { throw JWS.JWSError.somethingWentWrong }
-		case .cwt:
-			let readerAuth = try ReaderAuth(data: [UInt8](statusListToken))
-			certsData = readerAuth.x5chain.map { Data($0) }
+		let attTF: AttestToken.Format = switch format { case .jwt: .jwt; case .cwt: .cwt }
+		let att = try x5cVerifyJwtOrCwt.parse(attestData: statusListToken, format: attTF)
+		if case let .jwt(jws) = att {
+			// Certificate-chain warnings must never permit an unsigned or MAC-authenticated JWT.
+			guard let algorithm = jws.protectedHeader.algorithm else {
+				throw WalletError(description: "Status JWT is missing a signature algorithm", code: .unsupportedAlgorithm)
+			}
+			switch algorithm {
+			case .RS256, .RS384, .RS512,
+				 .ES256, .ES384, .ES512, .ES256K,
+				 .PS256, .PS384, .PS512, .EdDSA:
+				break
+			case .HS256, .HS384, .HS512, .none, .invalid:
+				throw WalletError(description: "Unsupported status JWT signature algorithm: \(algorithm.rawValue)", code: .unsupportedAlgorithm)
+			}
 		}
-		guard certsData.count > 0 else { throw JWS.JWSError.somethingWentWrong }
-		let (isValid, reason) = await trustConfig.accessTrustManager.validateCertTrustPath(chain: certsData)
+		let (isValid, reason) = try await x5cVerifyJwtOrCwt.validateTrust(att, trustValidator: trustConfig.accessTrustManager)
 		guard isValid else {
 			let message = "\(format) status token trust error: \(reason ?? "")"
 			switch trustConfig.statusTrustPolicy {
-			case .warning:
-				Self.logger.warning("\(message)")
-				return
-			case .enforce:
-				throw WalletError(description: message, code: .trustError)
+			case .warning: Self.logger.warning("\(message)"); return
+			case .enforce: throw WalletError(description: message, code: .trustError)
 			}
 		}
 	}
 }
+
 
 

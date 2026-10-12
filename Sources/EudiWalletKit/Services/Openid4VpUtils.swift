@@ -70,7 +70,7 @@ class OpenId4VpUtils {
 		var zkSpecsRequested: [DocType: [ZkSystemSpec]]?
 		for credQuery in dcql.credentials {
 			let formatRequested: DocDataFormat = credQuery.dataFormat
-			guard let docType = credQuery.docType else { continue }
+			guard let docType = credQuery.docTypeOrVct else { continue }
 			if !idsToDocTypes.values.contains(docType) {logger?.warning("Document type \(docType) not in supported document types \(idsToDocTypes.values)")}
 			inputDescriptorMap[docType] = credQuery.id.value; formatsRequested[docType] = formatRequested
 			if let zkSpecs = credQuery.zkSpecs {
@@ -173,7 +173,6 @@ class OpenId4VpUtils {
 		claimValues: inout [Document.ID: [ClaimPath: [String]]]
 	) {
 		var paths = [ClaimPath](); var values = [ClaimPath: [String]]()
-
 		for (docId, issuerSigned) in docsCbor ?? [:] {
 			paths.removeAll(); values.removeAll()
 			guard let isNs = issuerSigned.issuerNameSpaces else { continue }
@@ -206,7 +205,12 @@ class OpenId4VpUtils {
 				}
 				let path = ClaimPath(mappedElements)
 				paths.append(path)
-				values[path] = disclosures
+				values[path] = disclosures.map { disclosure in
+					guard let data = Data(base64URLEncoded: disclosure),
+						  let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
+						  json.count >= 3 else { return disclosure }
+					return if let strValue = json[2] as? String { strValue } else { "\(json[2])" }
+				}
 			}
 			claimPaths[docId] = paths
 			claimValues[docId] = values
@@ -230,8 +234,9 @@ class OpenId4VpUtils {
 	static func getSdJwtPresentation(_ sdJwt: SignedSDJWT, hashingAlg: HashingAlgorithm, signer: SecureAreaSigner, signAlg: JSONWebAlgorithms.SigningAlgorithm, requestItems: [RequestItem], nonce: String, aud: String, transactionData: [TransactionData]?) async throws -> SignedSDJWT? {
 		guard let allPathsDict = (try sdJwt.recreateClaims()).disclosuresPerClaimPath else { throw WalletError(description: "No disclosures found", code: .internalError) }
 		let allPaths = Array(allPathsDict.keys)
-		let query = Set(allPaths.filter { path in requestItems.contains(where: { r in r.claimPath == path }) })
-		for q in query { print(q.value.map(\.description) ) }
+		print(allPaths.map { p in p.value.map { $0.description } })
+		let query = Set(requestItems.map(\.claimPath)) 
+		logger.info("Dcql query paths: \(query.map { $0.value.map(\.description) })")
 		let presentedSdJwt = try sdJwt.present(query: query)
 		guard let presentedSdJwt else { return nil }
 		let digestCreator = DigestCreator(hashingAlgorithm: hashingAlg)
@@ -276,7 +281,7 @@ extension ClaimPathElement {
 }
 
 extension CredentialQuery {
-	public var docType: String? {
+	public var docTypeOrVct: String? {
 		let mdocTypeValue = meta.dictionaryObject?["doctype_value"]
 		let vctValues = meta.dictionaryObject?["vct_values"]
 		let metaDocType = mdocTypeValue ?? vctValues ?? meta.dictionaryObject?.first?.value
@@ -297,7 +302,7 @@ extension CredentialQuery {
 }
 
 extension ClaimPath {
- 	public func contains2(_ that: ClaimPath) -> Bool { zip(self.value, that.value).allSatisfy { (selfElement, thatElement) in selfElement.contains(thatElement) } }
+	public func contains2(_ that: ClaimPath) -> Bool { zip(self.value, that.value).allSatisfy { (selfElement, thatElement) in selfElement.contains(thatElement) } }
 }
 
 extension DCQL {
@@ -340,13 +345,29 @@ extension OpenId4VpUtils {
 	/// - Returns: A dictionary mapping matched credential IDs to arrays of ClaimPath objects representing
 	///            the claims to disclose
 	/// - Throws: WalletError if the query cannot be satisfied, with details about the first missing claim
+	/// Build a DCQL query equivalent to the items requested in an ISO/IEC 18013-5 device request.
+	///
+	/// Used to validate the scope of a proximity (BLE) request against the relying party registration policy.
+	/// - Parameter itemsRequested: The requested items (docType to namespaced data elements)
+	/// - Returns: A DCQL query with one mso-mdoc credential query per requested document type
+	static func makeDcql(itemsRequested: RequestItems) throws -> DCQL {
+		let credentials: [CredentialQuery] = try itemsRequested.enumerated().map { index, docRequest in
+			let (docType, nsItems) = docRequest
+			let claims: [ClaimsQuery] = try nsItems.flatMap { ns, items in
+				try items.map { try ClaimsQuery.mdoc(namespace: ns, claimName: $0.elementIdentifier, intentToRetain: $0.intentToRetain) }
+			}
+			return try CredentialQuery(id: QueryId(value: "cred\(index)"), format: Format.MsoMdoc(), meta: JSON(["doctype_value": docType]), claims: claims.isEmpty ? nil : claims)
+		}
+		return try DCQL(credentials: credentials)
+	}
+
 	static func resolveDcql(_ dcql: DCQL, queryable: DcqlQueryable, docTypeDisplayNames: [DocType: String] = [:]) throws -> CredentialSelectionSetOptions {
 		var resultDict: CredentialSelectionSetOptions = [:]
 		var lastError: WalletError?
 		var credentialQueryResults: OrderedDictionary<QueryId, [CredentialSelection]> = [:]
 		// Step 1: Process individual credential queries
 		for credQuery in dcql.credentials {
-			guard let docType = credQuery.docType else { throw WalletError(description: "Credential query \(credQuery.id.value) does not have a doc type", code: .invalidQueryResolution) }
+			guard let docType = credQuery.docTypeOrVct else { throw WalletError(description: "Credential query \(credQuery.id.value) does not have a doc type", code: .invalidQueryResolution) }
 			let format = credQuery.dataFormat
 			let isMultiple = credQuery.multiple == true
 			// Find matching credentials
@@ -367,7 +388,7 @@ extension OpenId4VpUtils {
 				}
 			}
 			if credentialQueryResults[credQuery.id]?.isEmpty != false, dcql.credentialSets == nil {
-   			 throw lastError ?? WalletError(description: "No credential satisfies query \(credQuery.id.value)", code: .dcqlQueryNotSatisfied)
+			 throw lastError ?? WalletError(description: "No credential satisfies query \(credQuery.id.value)", code: .dcqlQueryNotSatisfied)
 			}
 		}
 		// Step 2: Handle credential_sets if present
@@ -472,10 +493,55 @@ extension OpenId4VpUtils {
 		}
 		if resultDict.isEmpty {
 			let notFoundCred = dcql.credentials.first { c in credentialQueryResults[c.id]?.isEmpty != false }
-			if let notFoundCred {logger.warning("No credential found matching docType: \(notFoundCred.docType ?? "") with format: \(notFoundCred.format)")}
+			if let notFoundCred {logger.warning("No credential found matching docType/vct: \(notFoundCred.docTypeOrVct ?? "") with format: \(notFoundCred.format)")}
 			throw lastError ?? WalletError(description: "DCQL query could not be satisfied", code: .dcqlQueryNotSatisfied)
 		}
 		return resultDict
+	}
+	
+	/// Validates that the request DCQL does not exceed the scope declared in the policy DCQL.
+	/// Issues warnings for any extra claims requested beyond what the policy permits.
+	/// - Parameters:
+	///   - dcql: The DCQL from the authorization request
+	///   - policyDcql: The DCQL declared in the WRPRC (permitted scope)
+	/// - Returns: Warnings for each extra claim path found in the request but not in the policy
+	static func validateDcqlPolicy(credentialSetOptions: CredentialSelectionSetOptions, policy: WrpRegistrationPolicy, wrpVpWarnings: inout [String: [PresentationPolicyViolation]]) {
+		for (key, selectionSet) in credentialSetOptions {
+			var violations = [PresentationPolicyViolation]()
+			for selection in selectionSet {
+				// Find matching policy credential by doctype or vct
+				let policyCredential = policy.credentials?.first { policyCred in
+					if let doctypeValue = policyCred.meta.doctypeValue {
+						return doctypeValue == selection.docType
+					}
+					if let vctValues = policyCred.meta.vctValues {
+						return vctValues.contains(selection.docType)
+					}
+					return false
+				}
+				guard let policyCredential else {
+					let messageViolation = "Credential '\(selection.docType)' (query: \(selection.queryId)) is not declared in the registration certificate policy"
+					violations.append(PresentationPolicyViolation(reason: .overAskedClaims(docType: selection.docType, claims: nil), message: messageViolation))
+					continue
+				}
+				// Compare claims: find claims in request that are not covered by policy
+				let requestClaims = selection.claimQueries
+				guard !requestClaims.isEmpty else { continue }
+				guard let pclaims = policyCredential.claims  else { continue }
+				let policyPaths: Set<ClaimPath> = Set(pclaims.map { policyClaim -> ClaimPath in
+					policyClaim.path.openID4VPClaimPath
+				})
+				let extraClaims = requestClaims.filter { requestClaim in
+					let claimPath = requestClaim.path
+					return !policyPaths.contains(where: { policyPath in policyPath.contains2(claimPath) })
+				}
+				if !extraClaims.isEmpty {
+					let extraPaths = extraClaims.map(\.path)
+					violations.append(PresentationPolicyViolation(reason: .overAskedClaims(docType: selection.docType, claims: extraPaths), message: "Credential '\(selection.docType)' requests claims beyond policy scope. Extra fields: [\(extraPaths.map { $0.value.map(\.description).joined(separator: "/") }.joined(separator: ", "))]"))
+				}
+			}
+			if !violations.isEmpty { wrpVpWarnings[key] = violations }
+		}
 	}
 
 	/// Resolves claims for a specific credential query and credential

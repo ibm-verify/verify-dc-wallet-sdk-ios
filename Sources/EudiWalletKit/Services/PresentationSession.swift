@@ -33,26 +33,36 @@ public final class PresentationSession: @unchecked Sendable, ObservableObject {
 	@Published public var readerCertIssuer: String?
 	/// Reader legal name (if provided)
 	@Published public var readerLegalName: String?
-	/// Reader certificate validation message (only for BLE transfer wih verifier using reader authentication)
+	/// Authentication of the current request, independent of certificate-name availability and registration warnings.
+	@Published public private(set) var readerAuthenticationStatus: ReaderAuthenticationStatus = .notEvaluated
+	/// Reader certificate validation message
 	@Published public var readerCertValidationMessage: String?
 	/// Reader certificate issuer is valid
 	@Published public var readerCertIssuerValid: Bool?
 	/// Error message when the ``status`` is in the error state.
 	@Published public var uiError: WalletError?
 	/// Request items selected by the user to be sent to verifier.
-	@Published public var disclosedDocumentSets: [[DocElements]] = []
+	@Published public var disclosedDocumentSets: [DisclosedDocumentSet] = []
 	/// Status of the data transfer.
 	@Published public var status: TransferStatus = .initializing
 	/// Device engagement data (QR data for the BLE flow)
 	@Published public var deviceEngagement: String?
+	/// The verifier (wallet relying party) registration policy decoded from the WRPRC carried in the request, if any
+	@Published public var wrpVerifierPolicy: WrpRegistrationPolicy?
+	/// Verifier registration warnings, keyed by credential query identifier; the empty key holds request-wide warnings
+	@Published public var wrpVerifierWarnings: [String:[PresentationPolicyViolation]]?
 	// map of document id to (doc type, format, display name) pairs
 	public var docIdToPresentInfo: [Document.ID: DocPresentInfo]!
 	// map of document id to key index to use
 	public var documentKeyIndexes: [Document.ID: Int]
 	/// User authentication required
-	var userAuthenticationRequired: Bool
+	public var userAuthenticationRequired: Bool
+	/// Local authentication context owned by the wallet and reused for every device-key operation.
+	public var localAuthenticationContext: ThreadSafeAuthContext
 	/// transaction logger
-	public var transactionLogger: (any TransactionLogger)?
+	public var transactionLogger: (any TransactionLogger)? {
+		didSet { presentationService.transactionLogger = transactionLogger }
+	}
 
 	public init(
 		presentationService: any PresentationService,
@@ -61,6 +71,7 @@ public final class PresentationSession: @unchecked Sendable, ObservableObject {
 		docIdToPresentInfo: [Document.ID: DocPresentInfo],
 		documentKeyIndexes: [Document.ID: Int],
 		userAuthenticationRequired: Bool,
+		localAuthenticationContext: ThreadSafeAuthContext,
 		transactionLogger: (any TransactionLogger)? = nil
 	) {
 		self.presentationService = presentationService
@@ -69,20 +80,35 @@ public final class PresentationSession: @unchecked Sendable, ObservableObject {
 		self.docIdToPresentInfo = docIdToPresentInfo
 		self.documentKeyIndexes = documentKeyIndexes
 		self.userAuthenticationRequired = userAuthenticationRequired
+		self.localAuthenticationContext = localAuthenticationContext
 		self.transactionLogger = transactionLogger
+		self.presentationService.transactionLogger = transactionLogger
 	}
 
 	@MainActor
 	/// Decodes a presentation request
 	///
-	/// The ``disclosedDocuments`` property will be set. Additionally ``readerCertIssuer`` and ``readerCertValidationMessage`` may be set
+	/// The ``disclosedDocumentSets`` property will be set. Additionally ``readerCertIssuer`` and ``readerCertValidationMessage`` may be set
 	/// - Parameter requests: Request information
 	func decodeRequest(_ requests: [UserRequestInfo]) throws {
 		guard docIdToPresentInfo.count > 0 else { throw WalletError(description: "No documents added to session ", code: .noDocumentsAvailable)}
+		if let service = presentationService as? OpenId4VpService {
+			readerAuthenticationStatus = service.readerAuthenticationStatus
+		} else {
+			let results = requests.flatMap { $0.readerAuthResults.values }
+			if !results.isEmpty, results.allSatisfy(\.isValidated) {
+				readerAuthenticationStatus = .authenticated
+			} else if results.contains(where: { !$0.isValidated && ($0.authBytes != nil || $0.certificateChain != nil) }) {
+				readerAuthenticationStatus = .failed
+			} else {
+				// Optional reader authentication may be absent with an informational message.
+				readerAuthenticationStatus = .notEvaluated
+			}
+		}
 		// show the items as checkboxes
-		disclosedDocumentSets = [[DocElements]]()
+		disclosedDocumentSets.removeAll()
 		for request in requests {
-			var disclosedDocuments = [DocElements]()
+			var disclosedElements = [DocElements]()
 			for (docId, docPresentInfo) in docIdToPresentInfo {
 				let docType = docPresentInfo.docType
 				let requestFormat = request.docDataFormats[docId] ?? request.docDataFormats[docType]  ?? request.docDataFormats.first(where: { OpenId4VpUtils.vctToDocTypeMatch($0.key, docType)})?.value
@@ -92,31 +118,33 @@ public final class PresentationSession: @unchecked Sendable, ObservableObject {
 						guard case let .msoMdoc(issuerSigned) = docPresentInfo.typedData else { continue }
 						guard let docItemsRequested = request.itemsRequested[docId] ?? request.itemsRequested[docType] else { continue }
 						let msoElements = issuerSigned.extractMsoMdocElements(docId: docId, docType: docType, displayName: docPresentInfo.displayName, docClaims: docPresentInfo.docClaims, itemsRequested: docItemsRequested)
-						disclosedDocuments.append(.msoMdoc(msoElements))
+						disclosedElements.append(.msoMdoc(msoElements))
 					case .sdjwt:
 						guard case let .sdJwt(signedSdJwt) = docPresentInfo.typedData else { continue }
 						guard let sdItemsRequested = request.itemsRequested[docId] ?? request.itemsRequested[docType] else { continue }
 						let sdJwtElements = signedSdJwt.extractSdJwtElements(docId: docId, vct: docType, displayName: docPresentInfo.displayName, docClaims: docPresentInfo.docClaims, itemsRequested: sdItemsRequested)
 						guard let sdJwtElements else { continue }
-						disclosedDocuments.append(.sdJwt(sdJwtElements))
+						disclosedElements.append(.sdJwt(sdJwtElements))
 					default: logger.error("Unsupported format \(docPresentInfo.docDataFormat) for \(docId)")
 				}
-
 			}
-			if let authResult = request.defaultReaderAuthResult, let readerAuthority = authResult.certificateIssuer {
-				readerCertIssuer = readerAuthority
-				readerCertIssuerValid = authResult.isValidated
-				readerCertValidationMessage = authResult.validationMessage
-			}
-			readerLegalName = request.defaultReaderAuthResult?.legalName
+			let authResult = request.defaultReaderAuthResult
+			readerCertIssuer = authResult?.certificateIssuer
+			readerCertIssuerValid = authResult?.isValidated
+			readerCertValidationMessage = authResult?.validationMessage
+			readerLegalName = readerAuthenticationStatus == .authenticated ? authResult?.legalName : nil
 			// TODO: localizationKey is kept for backward compatibility — clients can migrate to use `code` instead
-			if disclosedDocuments.count == 0 { throw WalletError(description: Self.NotAvailableStr, localizationKey: "request_data_no_document", code: .noDocumentsAvailable) }
-			disclosedDocumentSets.append(disclosedDocuments)
-		}
+			if disclosedElements.count == 0 { throw WalletError(description: Self.notAvailableStr, localizationKey: "request_data_no_document", code: .noDocumentsAvailable) }
+			let warningsKey = if presentationService.flow == .ble { presentationService.wrpVerifierWarnings?.keys.first(where: { !$0.isEmpty }) } else { request.requestName }
+			let warningSet: [PresentationPolicyViolation]? = if let warnings = presentationService.wrpVerifierWarnings, let warningsKey { warnings[warningsKey] } else { nil }
+			disclosedDocumentSets.append(DisclosedDocumentSet(docElements: disclosedElements, warnings: warningSet))
+		} // next request
+		wrpVerifierPolicy = presentationService.wrpVerifierPolicy
+		wrpVerifierWarnings = presentationService.wrpVerifierWarnings
 		status = .requestReceived
 	}
 
-	static let NotAvailableStr = "The requested document is not available in your EUDI Wallet. Please contact the authorised issuer for further information."
+	static let notAvailableStr = "The requested document is not available in your EUDI Wallet. Please contact the authorised issuer for further information."
 
 	/// Start QR engagement to be presented to verifier
 	///
@@ -124,9 +152,9 @@ public final class PresentationSession: @unchecked Sendable, ObservableObject {
 	/// On error ``uiError`` will be filled and ``status`` will be ``.error``
 	public func startQrEngagement() async throws {
 		// TODO: localizationKey is kept for backward compatibility — clients can migrate to use `code` instead
-		if docIdToPresentInfo.count == 0 { await setError(Self.NotAvailableStr, localizationKey: "request_data_no_document", code: .noDocumentsAvailable); return }
+		if docIdToPresentInfo.count == 0 { await setError(Self.notAvailableStr, localizationKey: "request_data_no_document", code: .noDocumentsAvailable); return }
 		do {
-			let data = try await presentationService.startQrEngagement(secureAreaName: nil, keyOptions: KeyOptions(curve: .P256, accessControl: []))
+			let data = try await presentationService.startQrEngagement(secureAreaName: nil, keyOptions: KeyOptions(curve: .P256, accessControl: .empty))
 			await MainActor.run {
 				deviceEngagement = data
 				status = .qrEngagementReady
@@ -157,16 +185,37 @@ public final class PresentationSession: @unchecked Sendable, ObservableObject {
 	/// Receive request from verifer
 	///
 	/// The request is futher decoded internally. See also ``decodeRequest(_:)``
-	/// On success ``disclosedDocuments`` published variable will be set  and ``status`` will be ``.requestReceived``
+	/// On success ``disclosedDocumentSets`` published variable will be set  and ``status`` will be ``.requestReceived``
 	/// On error ``uiError`` will be filled and ``status`` will be ``.error``
 	/// - Returns: A request object
 	public func receiveRequest() async -> [UserRequestInfo]? {
+		await MainActor.run {
+			readerAuthenticationStatus = .notEvaluated
+			readerCertIssuer = nil; readerCertIssuerValid = nil; readerCertValidationMessage = nil; readerLegalName = nil
+			disclosedDocumentSets.removeAll()
+			wrpVerifierPolicy = nil; wrpVerifierWarnings = nil
+			uiError = nil
+		}
+		await presentationService.persistTransactionLog()
 		do {
 			let request = try await presentationService.receiveRequest()
+			await presentationService.persistTransactionLog()
 			try await decodeRequest(request)
 			return request
 		} catch {
+			TransactionLogUtils.withResult(.notCompleted, reason: error.localizedDescription, transactionLog: &presentationService.transactionLog)
+			await presentationService.persistTransactionLog()
 			let walletError = error as? WalletError
+			await MainActor.run {
+				readerAuthenticationStatus = .failed
+				readerLegalName = nil
+				disclosedDocumentSets.removeAll()
+				if let service = presentationService as? OpenId4VpService {
+					readerCertIssuer = service.readerCertificateIssuer.map(MdocHelpers.getCN(from:))
+					readerCertIssuerValid = service.readerAuthValidated
+					readerCertValidationMessage = service.readerCertificateValidationMessage
+				}
+			}
 			await setError(error.localizedDescription, localizationKey: walletError?.localizationKey, code: walletError?.code ?? .internalError, innerError: error)
 			return nil
 		}
@@ -188,7 +237,7 @@ public final class PresentationSession: @unchecked Sendable, ObservableObject {
 		}
 	}
 
-/// Send response to verifier
+	/// Send response to verifier
 	/// - Parameters:
 	///   - userAccepted: Whether user confirmed to send the response
 	///   - itemsToSend: Data to send organized into a hierarchy of doc.types and namespaces
@@ -197,22 +246,47 @@ public final class PresentationSession: @unchecked Sendable, ObservableObject {
 	///   - onSuccess: Callback invoked on successful response with an optional redirect URL
 	public func sendResponse(userAccepted: Bool, itemsToSend: RequestItems, deviceNameSpacesToSend: RequestDeviceNameSpaces? = nil, onCancel: (() -> Void)? = nil, onSuccess: (@Sendable (URL?) -> Void)? = nil) async throws {
 		do {
-			await MainActor.run { status = .userSelected }
-			let action = { [ weak self] in _ = try await self?.presentationService.sendResponse(
-				userAccepted: userAccepted,
-				itemsToSend: itemsToSend,
-				deviceNameSpacesToSend: deviceNameSpacesToSend,
-				onSuccess: onSuccess)
+			if presentationService is OpenId4VpService {
+				let authentication = await MainActor.run { readerAuthenticationStatus }
+				guard authentication == .authenticated || authentication == .notApplicable else {
+					throw WalletError(description: "No successfully decoded presentation request", code: .notSecuredRequest)
+				}
 			}
-			try await EudiWallet.authorizedAction(action: action, disabled: !userAuthenticationRequired, dismiss: { onCancel?() }, localizedReason: NSLocalizedString("authenticate_to_share_data", comment: "") )
-			try await updateKeyBatchInfoAndDeleteCredentialIfNeeded(presentedIds: Array(itemsToSend.keys), zkpDocumentIds: presentationService.zkpDocumentIds)
+			await MainActor.run { status = .userSelected }
+			let action = { [self] in
+				try await presentationService.sendResponse(userAccepted: userAccepted, itemsToSend: itemsToSend,
+					deviceNameSpacesToSend: deviceNameSpacesToSend, authenticationContext: localAuthenticationContext, onSuccess: onSuccess)
+				return true
+			}
+			let didSend = try await EudiWallet.authorizedAction(action: action, disabled: !userAuthenticationRequired || !userAccepted,
+				dismiss: { onCancel?() }, localizedReason: NSLocalizedString("authenticate_to_share_data", comment: ""), authenticationContext: localAuthenticationContext)
+			guard didSend == true else {
+				TransactionLogUtils.withResult(.notCompleted, reason: "User cancelled authentication", transactionLog: &presentationService.transactionLog)
+				await presentationService.persistTransactionLog()
+				return
+			}
+			await presentationService.persistTransactionLog()
+			let completed = presentationService.transactionLog.transactionResult == .completed
+			let presentedIds: [String]
+			if let bleService = presentationService as? BlePresentationService {
+				presentedIds = bleService.documentIds + (bleService.zkpDocumentIds ?? [])
+			} else if let openIdService = presentationService as? OpenId4VpService {
+				presentedIds = openIdService.presentedDocumentIds
+			} else {
+				presentedIds = completed ? Array(itemsToSend.keys) : []
+			}
+			try await updateKeyBatchInfoAndDeleteCredentialIfNeeded(presentedIds: presentedIds, zkpDocumentIds: presentationService.zkpDocumentIds)
+			guard completed else { return }
 			await MainActor.run { status = .responseSent; storageManager?.objectWillChange.send() }
-			if let transactionLogger { do { try await transactionLogger.log(transaction: presentationService.transactionLog) } catch { logger.error("Failed to log transaction: \(error)") } }
+			await presentationService.persistTransactionLog()
 		} catch {
 			let walletError = error as? WalletError
 			await setError(error.localizedDescription, code: walletError?.code ?? .internalError, innerError: error)
-			let setErrorTransactionLog = presentationService.transactionLog.copy(status: .failed, errorMessage: error.localizedDescription)
-			if let transactionLogger { do { try await transactionLogger.log(transaction: setErrorTransactionLog) } catch { logger.error("Failed to log transaction") } }
+			// A storage/usage-counter error after successful dispatch does not undo the presentation.
+			if presentationService.transactionLog.transactionResult != .completed {
+				TransactionLogUtils.withResult(.notCompleted, reason: error.localizedDescription, transactionLog: &presentationService.transactionLog)
+			}
+			await presentationService.persistTransactionLog()
 			throw error
 		}
 	}

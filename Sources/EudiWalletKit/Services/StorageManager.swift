@@ -161,8 +161,8 @@ public final class StorageManager: ObservableObject, @unchecked Sendable {
 		let cmd = md?.claimMetadata?.convertToCborClaimMetadata(uiCulture)
 		let credentialIssuerIdentifier = md?.credentialIssuerIdentifier
 		let configurationIdentifier = md?.configurationIdentifier
-		let statusIdentifier = iss.issuerAuth.statusIdentifier
-		let configuration = DocClaimsModelConfiguration(id: d.0, createdAt: doc.createdAt, docType: doc.docType, displayName: md?.displayName, display: md?.display, issuerDisplay: md?.issuerDisplay, credentialIssuerIdentifier: credentialIssuerIdentifier, configurationIdentifier: configurationIdentifier, validFrom: iss.validFrom, validUntil: iss.validUntil, statusIdentifier: statusIdentifier, credentialsUsageCounts: nil, credentialPolicy: docKeyInfo.credentialPolicy, secureAreaName: docKeyInfo.secureAreaName, modifiedAt: doc.modifiedAt, docClaims: [], docDataFormat: .cbor, hashingAlg: nil)
+		let statusList = iss.issuerAuth.statusList
+		let configuration = DocClaimsModelConfiguration(id: d.0, createdAt: doc.createdAt, docType: doc.docType, displayName: md?.displayName, display: md?.display, issuerDisplay: md?.issuerDisplay, credentialIssuerIdentifier: credentialIssuerIdentifier, configurationIdentifier: configurationIdentifier, validFrom: iss.validFrom, validUntil: iss.validUntil, statusList: statusList, credentialsUsageCounts: nil, credentialPolicy: docKeyInfo.credentialPolicy, secureAreaName: docKeyInfo.secureAreaName, modifiedAt: doc.modifiedAt, docClaims: [], docDataFormat: .cbor, hashingAlg: nil)
 		var retModel: DocClaimsModel? = modelFactory?.makeClaimsDecodableFromCbor(configuration: configuration, issuerSigned: iss, displayNames: cmd?.displayNames, mandatory: cmd?.mandatory)
 		if retModel == nil {
 			let defModel: DocClaimsModel? = switch doc.docType {
@@ -233,8 +233,8 @@ public final class StorageManager: ObservableObject, @unchecked Sendable {
 
 	public static func getCredentialsUsageCount(id: String, secureAreaName: String?) async throws -> CredentialsUsageCounts? {
 		let kbi = try await SecureAreaRegistry.shared.get(name: secureAreaName).getKeyBatchInfo(id: id)
-		let remaining: Int? = if kbi.credentialPolicy == .rotateUse { nil } else { kbi.usedCounts.count { $0 == 0 } }
-		return remaining.map { try! CredentialsUsageCounts(total: kbi.usedCounts.count, remaining: $0) }
+		let remaining = if kbi.credentialPolicy == .rotateUse { kbi.usedCounts.count } else { kbi.usedCounts.count { $0 == 0 } }
+		return try! CredentialsUsageCounts(total: kbi.usedCounts.count, remaining: remaining)
 	}
 
 	/// Load documents from storage

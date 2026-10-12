@@ -29,6 +29,8 @@ public struct EudiWalletConfiguration: Sendable {
 	public let userAuthenticationRequired: Bool
 	/// Method to perform mdoc authentication (MAC or signature). Defaults to device signature
 	public let deviceAuthMethod: DeviceAuthMethod
+	/// COSE algorithm for mdoc device signatures. Defaults to ES256 and is ignored for device MACs.
+	public let deviceAlgorithm: Cose.VerifyAlgorithm
 	/// preferred UI culture for localization of display names. It must be a 2-letter language code. If not set, the system locale is used
 	public let uiCulture: String?
 	/// If not-nil, logging to the specified log file name will be configured
@@ -38,6 +40,9 @@ public struct EudiWalletConfiguration: Sendable {
 	/// - `.client`: The holder device acts as a GATT central (client), scanning and connecting to the reader's peripheral.
 	/// - `.both`: The holder device supports both peripheral server and central client modes simultaneously.
 	public let bleTransferMode: BleTransferMode
+	/// Optional factory for creating custom BLE transport instances (e.g., L2CAP, BLE client mdoc).
+	/// When `nil`, the default GATT server/central transports are used.
+	public let bleTransportFactory: (any BleTransportFactory)?
 	/// Default service name for the keychain, used if no service name is provided in the initializer
 	static let defaultServiceName: String = "eudiw"
 
@@ -46,16 +51,20 @@ public struct EudiWalletConfiguration: Sendable {
 		accessGroup: String? = nil,
 		userAuthenticationRequired: Bool = false,
 		deviceAuthMethod: DeviceAuthMethod = .deviceSignature,
+		deviceAlgorithm: Cose.VerifyAlgorithm = .es256,
 		uiCulture: String? = nil,
 		logFileName: String? = nil,
-		bleTransferMode: BleTransferMode = .server
+		bleTransferMode: BleTransferMode = .server,
+		bleTransportFactory: (any BleTransportFactory)? = nil
 	) {
 		self.serviceName = serviceName ?? Self.defaultServiceName
 		self.accessGroup = accessGroup
         self.userAuthenticationRequired = userAuthenticationRequired
 		self.deviceAuthMethod = deviceAuthMethod
+		self.deviceAlgorithm = deviceAlgorithm
 		self.uiCulture = uiCulture
 		self.logFileName = logFileName
 		self.bleTransferMode = bleTransferMode
+		self.bleTransportFactory = bleTransportFactory
 	}
 }

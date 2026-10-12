@@ -64,6 +64,9 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 	public private(set) var readerAuthenticationStatus: ReaderAuthenticationStatus = .notEvaluated
 	private let requestOperationLock = OSAllocatedUnfairLock(initialState: false)
 	var readerAuthValidated: Bool = false
+	/// `true` when the reader chain failed trust validation but was accepted because `trustConfig.defaultPolicy == .warning`.
+	/// `readerAuthValidated` stays `false` in that case so the UI still reports the reader as untrusted.
+	var readerTrustAcceptedByPolicy: Bool = false
 	var readerCertificateIssuer: String?
 	var readerCertificateValidationMessage: String?
 	var certificateChain: [Data]?
@@ -146,6 +149,7 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 	private func resetPresentationState() {
 		readerAuthenticationStatus = .notEvaluated
 		readerAuthValidated = false
+		readerTrustAcceptedByPolicy = false
 		readerCertificateIssuer = nil
 		readerCertificateValidationMessage = nil
 		certificateChain = nil
@@ -201,7 +205,8 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 			if !warnings.isEmpty { logger.warning("Policy warnings: \(warnings.mapValues{$0.map(\.violation)})") }
 			switch rrd.client {
 			case .x509SanDns(_, let certificate), .x509Hash(_, let certificate):
-				guard readerAuthValidated, let leaf = certificateChain?.first,
+				// The leaf must still match the request certificate even when trust was accepted by `.warning` policy.
+				guard readerAuthValidated || readerTrustAcceptedByPolicy, let leaf = certificateChain?.first,
 					let validatedCertificate = try? X509.Certificate(derEncoded: [UInt8](leaf)),
 					validatedCertificate == certificate else {
 					let message = "Required reader certificate authentication was not established"
@@ -454,6 +459,7 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 	lazy var chainVerifier: CertificateTrust = { [weak self] certificates async -> Bool in
 		guard let self else { return false }
 		self.readerAuthValidated = false
+		self.readerTrustAcceptedByPolicy = false
 		self.readerCertificateIssuer = nil
 		self.certificateChain = nil
 		self.readerCertificateValidationMessage = "The reader certificate chain is malformed"
@@ -467,6 +473,13 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 		self.readerAuthValidated = isValid
 		self.readerCertificateValidationMessage = failureReason ?? (isValid ? nil : "The reader certificate chain is not trusted")
 		self.certificateChain = certsData
+		// Honour defaultPolicy — when .warning, log and allow the flow to proceed instead of hard-blocking.
+		// Mirrors the issuer certificate pattern in OpenId4VciService.
+		if !isValid && self.trustConfig.defaultPolicy == .warning {
+			logger.warning("Reader cert chain not trusted (defaultPolicy=.warning, proceeding): \(failureReason ?? "unknown reason")")
+			self.readerTrustAcceptedByPolicy = true
+			return true
+		}
 		return isValid
 	}
 

@@ -379,6 +379,31 @@ struct OpenId4VpAuthenticationTests {
         }
     }
 
+    @Test("defaultPolicy .warning lets an untrusted reader chain reach consent, reported as not validated")
+    func warningPolicyAcceptsUntrustedCertificate() async throws {
+        let fixture = try CertificateFixture()
+        for clientId in fixture.clientIds {
+            let token = try fixture.token(clientId: clientId, validSignature: true)
+            let (service, _) = try await makeService(clientId: clientId, token: token, anchors: [], defaultPolicy: .warning)
+            let requests = try await service.receiveRequest()
+            #expect(!requests.isEmpty)
+            #expect(service.readerTrustAcceptedByPolicy)
+            #expect(!service.readerAuthValidated)
+            let authentication = try #require(requests.first?.readerAuthResults[""])
+            #expect(!authentication.isValidated)
+        }
+    }
+
+    @Test("defaultPolicy .warning does not bypass JAR signature verification")
+    func warningPolicyRejectsInvalidSignature() async throws {
+        let fixture = try CertificateFixture()
+        for clientId in fixture.clientIds {
+            let token = try fixture.token(clientId: clientId, validSignature: false)
+            let (service, network) = try await makeService(clientId: clientId, token: token, anchors: [], defaultPolicy: .warning)
+            await assertRejected(service, network: network)
+        }
+    }
+
     @Test("Authenticated X.509 requests reach consent with the expected client ID", arguments: [false, true])
     func acceptsSignedRequest(byReference: Bool) async throws {
         let fixture = try CertificateFixture()
@@ -433,12 +458,13 @@ struct OpenId4VpAuthenticationTests {
 
     private func makeService(clientId: String, token: String?, byReference: Bool = false,
                              anchors: [Data] = [], registration: RegistrationMode = .disabled,
-                             clientIdSchemes: [ClientIdScheme]? = nil) async throws -> (OpenId4VpService, RequestNetworking) {
+                             clientIdSchemes: [ClientIdScheme]? = nil,
+                             defaultPolicy: TrustPolicy = .enforce) async throws -> (OpenId4VpService, RequestNetworking) {
         let registrationPolicy: TrustPolicy = registration == .warning ? .warning : .enforce
         #if canImport(EudiEtsi1196x2)
-        let trust = TrustConfiguration(trustSource: .staticList(.init(rootCertificates: anchors, method: .directTrust)), wrprcVpTrustPolicy: registrationPolicy)
+        let trust = TrustConfiguration(trustSource: .staticList(.init(rootCertificates: anchors, method: .directTrust)), defaultPolicy: defaultPolicy, wrprcVpTrustPolicy: registrationPolicy)
         #else
-        let trust = TrustConfiguration(rootIaca: anchors.map { [$0] }, wrprcVpTrustPolicy: registrationPolicy)
+        let trust = TrustConfiguration(rootIaca: anchors.map { [$0] }, defaultPolicy: defaultPolicy, wrprcVpTrustPolicy: registrationPolicy)
         #endif
         let resource = try #require(Bundle.module.url(forResource: "mdoc-mdl", withExtension: "txt"))
         let encoded = try String(contentsOf: resource, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)

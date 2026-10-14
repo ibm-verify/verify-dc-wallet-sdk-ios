@@ -390,7 +390,10 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 				config = config.copy(authFlowRedirectionURI: authFlowRedirectionURI)
 			}
 		} else {
-			throw WalletError(description: "VCI configuration not provided for url \(urlString)", code: .missingVciConfiguration)
+			// Restore pre-v0.54.8 behaviour: construct a default configuration from the issuer
+			// URL when no fallback service is registered, rather than throwing. This preserves
+			// the stateless flow — the caller is not required to pre-register any service.
+			config = OpenId4VciConfiguration(credentialIssuerURL: urlString)
 		}
 		let vciService = try registerOpenId4VciService(name: urlString, config: config)
 		return vciService

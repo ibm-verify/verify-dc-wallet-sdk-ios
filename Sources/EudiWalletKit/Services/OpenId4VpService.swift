@@ -507,7 +507,11 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 			errorDispatchPolicy: openID4VpConfig.errorDispatchPolicy,
 			session: networking,
 			responseEncryptionConfiguration: openID4VpConfig.responseEncryptionConfiguration ?? .default(),
-			registrationCertificatePolicy: openID4VpConfig.validateRegistrationCertificate ? .default(validator: wrpRegistrationValidator) : nil
+			// Only enable WRPRC policy when explicitly configured AND the trust policy is .enforce.
+			// When wrprcVpTrustPolicy is .warning the gateway may not include verifier_info at all;
+			// the upstream openid4vp-swift library throws before our policy check can run in that case.
+			// Setting nil skips WRPRC extraction entirely, matching pre-v0.54.8 behaviour.
+			registrationCertificatePolicy: openID4VpConfig.validateRegistrationCertificate && trustConfig.wrprcVpTrustPolicy == .enforce ? .default(validator: wrpRegistrationValidator) : nil
 		)
 		return res
 	}

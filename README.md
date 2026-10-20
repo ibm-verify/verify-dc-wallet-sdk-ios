@@ -20,7 +20,7 @@ fork once merged.
 ## SPM Integration
 
 **Xcode project:** File → Add Package Dependencies → enter the URL below and set the version
-rule to `Up to Next Major Version` from `1.0.0`.
+rule to `Up to Next Major Version` from `1.1.0`.
 
 ```
 https://github.com/ibm-verify/verify-dc-wallet-sdk-ios.git
@@ -30,7 +30,7 @@ https://github.com/ibm-verify/verify-dc-wallet-sdk-ios.git
 
 ```swift
 // In Package.swift dependencies:
-.package(url: "https://github.com/ibm-verify/verify-dc-wallet-sdk-ios.git", from: "1.0.0")
+.package(url: "https://github.com/ibm-verify/verify-dc-wallet-sdk-ios.git", from: "1.1.0")
 
 // In your target dependencies:
 .product(name: "EudiWalletKit", package: "verify-dc-wallet-sdk-ios")

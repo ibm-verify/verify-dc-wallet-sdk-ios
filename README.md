@@ -11,9 +11,9 @@ fork once merged.
 
 ## Requirements
 
-- iOS 16.0+
-- Swift 6.0+
-- Xcode 16.0+
+- iOS 17.0+
+- Swift 6.2+
+- Xcode 26.0+
 
 ---
 
@@ -62,7 +62,12 @@ is validated and supported only against the IBM server products listed above.
 | IBM Fork Version | Upstream `eudi-lib-ios-wallet-kit` | Upstream SHA | IBM Patches | Date |
 |---|---|---|---|---|
 | `v1.0.0` | `v0.35.2` | `181a53cb` | [Fix log entries overwriting each other](#v100--fix-log-entries-overwriting-each-other) | 2026-08-19 |
-| `v1.1.0` | `v0.54.8` | `54858f3f` | [Restore stateless VCI auto-config](#v110--restore-stateless-autoregisterviciconfiguration-when-registry-is-empty) · [Honour defaultPolicy .warning for reader chains](#v110--honour-trustconfigurationdefaultpolicy-warning-for-x509-reader-chains) · [Skip WRPRC extraction under .warning policy](#v110--skip-wrprc-extraction-when-wrprcvptrustpolicy-is-warning) · [CI workflow housekeeping](#v110--retain-upstream-ci-workflow-housekeeping) | 2026-10-15 |
+| `v1.1.0` | `v0.56.1` | `2df9cfba` | [Restore stateless VCI auto-config](#v110--restore-stateless-autoregisterviciconfiguration-when-registry-is-empty) · [Skip WRPRC extraction under .warning policy](#v110--skip-wrprc-extraction-when-wrprcvptrustpolicy-is-warning) · [CI workflow housekeeping](#v110--ci-workflow-housekeeping) | 2026-10-20 |
+
+> **`v1.1.0` history:** `v1.1.0` was first cut against upstream `v0.54.8` (`54858f3f`) and
+> re-pointed at upstream `v0.56.1` on 2026-10-20. That change drops the
+> `defaultPolicy .warning` reader-chain patch, which upstream now covers with
+> `TrustConfiguration.readerTrustPolicy` (see [Dropped patches](#dropped-patches)).
 
 ---
 
@@ -88,62 +93,29 @@ dropped from the next IBM fork release.
 **Commit:** `9140abe0`  
 **File:** `Sources/EudiWalletKit/EudiWallet.swift` (+4, −1)
 
-Upstream `v0.54.8` changed the empty-registry branch of `autoRegisterVciConfiguration` to
-throw `missingVciConfiguration`. This broke any consuming app that passes a fully-specified
-`OpenId4VciConfiguration` per call (e.g. built from the scanned offer URL at runtime) without
-pre-registering a VCI service at startup. Every credential offer immediately failed.
+Since upstream `v0.36.0` (commit `81a26c83`, a compile fix after an OpenID4VCI library update,
+with no changelog entry) the empty-registry branch of `autoRegisterVciConfiguration` throws
+`WalletError.missingVciConfiguration`. This breaks any consuming app that passes a
+fully-specified `OpenId4VciConfiguration` per call (e.g. built from the scanned offer URL at
+runtime) without pre-registering a VCI service at startup: every credential offer fails in
+`resolveOfferUrlDocTypes`. IBM `v1.0.0` (based on upstream `v0.35.2`) pre-dates the throw.
 
-The IBM patch restores the pre-v0.54.8 stateless behaviour: when no fallback service is found
-in the registry, a default `OpenId4VciConfiguration` is constructed from the issuer URL rather
-than throwing. No pre-registration is required in the calling app.
+The IBM patch keeps the original stateless behaviour: when no fallback service is found in the
+registry, a default `OpenId4VciConfiguration` is constructed from the issuer URL rather than
+throwing. No pre-registration is required in the calling app.
 
 ```swift
-// Before (v0.54.8 — throws):
+// Upstream (throws):
 throw WalletError(description: "VCI configuration not provided …", code: .missingVciConfiguration)
 
-// After (IBM patch — restores stateless behaviour):
+// IBM patch (stateless):
 config = OpenId4VciConfiguration(credentialIssuerURL: urlString)
 ```
 
-> **Watch point:** upstream introduced this throw deliberately. If a future upstream release
-> re-introduces it, the IBM patch will conflict on the next sync. Monitor
-> `autoRegisterVciConfiguration` in upstream diffs.
-
----
-
-### `v1.1.0` — Honour `TrustConfiguration.defaultPolicy .warning` for x509 reader chains
-
-**Commit:** `18595ff6`  
-**Files:** `Sources/EudiWalletKit/Services/OpenId4VpService.swift` (+15, −4) · `Tests/.../OpenId4VpAuthenticationTests.swift` (+32, −2)
-
-Upstream commit `dcaca10c` (included in v0.54.8) added a strict `guard readerAuthValidated`
-gate in `OpenId4VpService` that fires before a VP response is sent. This gate blocks all
-OpenID4VP presentations when the reader's X.509 chain fails trust validation — even when the
-app has configured `TrustConfiguration(defaultPolicy: .warning)`. The result was every
-QR-scanned verification failing with _"Required reader certificate authentication was not
-established"_, regardless of the configured policy.
-
-The IBM patch adds a second Boolean flag `readerTrustAcceptedByPolicy` to `OpenId4VpService`.
-The `chainVerifier` closure sets this flag (and returns `true`) when trust validation fails but
-`defaultPolicy == .warning`, logging a warning. The reader-auth guard is widened to
-`readerAuthValidated || readerTrustAcceptedByPolicy`. `readerAuthValidated` stays `false` so
-the UI correctly reports the reader as untrusted — only the hard block is lifted. The JAR
-signature and leaf-certificate match checks remain fully enforced.
-
-```swift
-// chainVerifier — new block (IBM patch):
-if !isValid && self.trustConfig.defaultPolicy == .warning {
-    logger.warning("Reader cert chain not trusted (defaultPolicy=.warning, proceeding): …")
-    self.readerTrustAcceptedByPolicy = true
-    return true
-}
-
-// Reader-auth guard — widened (IBM patch):
-guard readerAuthValidated || readerTrustAcceptedByPolicy, let leaf = certificateChain?.first, …
-```
-
-> **Production note:** `defaultPolicy: .warning` is a development convenience. For production
-> deployments set `defaultPolicy: .enforce` so untrusted reader chains are hard-rejected.
+> **Watch point:** the upstream source has a `Todo: validate … by a trusted list` comment in
+> this function, so upstream may restrict unregistered issuers in future. If a future upstream
+> release changes `autoRegisterVciConfiguration`, this patch will conflict on the next sync.
+> Monitor that function in upstream diffs.
 
 ---
 
@@ -152,22 +124,22 @@ guard readerAuthValidated || readerTrustAcceptedByPolicy, let leaf = certificate
 **Commit:** `4a6a57b0`  
 **File:** `Sources/EudiWalletKit/Services/OpenId4VpService.swift` (+5, −1)
 
-Upstream `v0.54.8` introduced WRPRC (Wallet Relying Party Registration Certificate) validation
-via `registrationCertificatePolicy`. When `wrprcVpTrustPolicy == .warning` and the verifier
+Upstream introduced WRPRC (Wallet Relying Party Registration Certificate) validation via
+`registrationCertificatePolicy` in `v0.38.0`, with `wrprcVpTrustPolicy` following in `v0.40.2`. When `wrprcVpTrustPolicy == .warning` and the verifier
 gateway does not include `verifier_info` in the JAR, the upstream `openid4vp-swift` library
 throws a hard `ValidationError` before the IBM trust-policy check can run, blocking all
-verification against gateways that pre-date the WRPRC feature (e.g. DMV gamma).
+verification against gateways that do not send `verifier_info` (e.g. DMV gamma).
 
 The IBM patch gates `registrationCertificatePolicy` on
 `trustConfig.wrprcVpTrustPolicy == .enforce`, so WRPRC extraction is skipped entirely under
-`.warning`, restoring the pre-v0.54.8 behaviour where the feature did not exist.
+`.warning`, as if the verifier did not use WRPRC.
 
 ```swift
-// Before (v0.54.8 — WRPRC extraction always attempted when validateRegistrationCertificate is true):
+// Upstream (WRPRC extraction always attempted when validateRegistrationCertificate is true):
 registrationCertificatePolicy: openID4VpConfig.validateRegistrationCertificate
     ? .default(validator: wrpRegistrationValidator) : nil
 
-// After (IBM patch — skipped when wrprcVpTrustPolicy is .warning):
+// IBM patch (skipped when wrprcVpTrustPolicy is .warning):
 registrationCertificatePolicy: openID4VpConfig.validateRegistrationCertificate
     && trustConfig.wrprcVpTrustPolicy == .enforce
     ? .default(validator: wrpRegistrationValidator) : nil
@@ -175,15 +147,27 @@ registrationCertificatePolicy: openID4VpConfig.validateRegistrationCertificate
 
 ---
 
-### `v1.1.0` — Retain upstream CI workflow (housekeeping)
+### `v1.1.0` — CI workflow housekeeping
 
-**Commit:** `033dc444`  
-**File:** `.github/workflows/swift.yml` (+7, −5)
+**File:** `.github/workflows/swift.yml`
 
-Reverts an accidental edit to the CI workflow introduced during the upstream v0.54.8 merge.
-The upstream workflow uses `swift build` / `swift test` directly; the accidental edit had
-replaced it with Fastlane. No functional change to the SDK. A comment has been added
-explaining the revert is intentional pending a review of PAT workflow scope for the IBM fork.
+The IBM fork's CI workflow differs from upstream: it runs `swift build` and `swift test` on
+`macos-latest`, whereas upstream runs `fastlane tests` on `macos-15`. It is left as-is during
+upstream syncs pending a review of PAT workflow scope for the IBM fork. No functional change to
+the SDK.
+
+---
+
+## Dropped patches
+
+| Patch | Dropped in | Reason |
+|---|---|---|
+| Honour `TrustConfiguration.defaultPolicy .warning` for x509 reader chains (`18595ff6`) | `v1.1.0` (re-point to `v0.56.1`) | Upstream added `TrustConfiguration.readerTrustPolicy` (default `.enforce`). With `.warning`, a validly signed request with an untrusted reader chain proceeds and reports `ReaderAuthenticationStatus.authenticatedWithUntrustedCertificate`. |
+
+**Migration:** `defaultPolicy` no longer controls reader-chain trust. Apps that relied on
+`defaultPolicy: .warning` to accept untrusted reader chains must also set
+`readerTrustPolicy: .warning`. As with the old patch, this is a development convenience; use
+`.enforce` in production.
 
 ---
 

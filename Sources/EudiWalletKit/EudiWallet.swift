@@ -390,9 +390,10 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 				config = config.copy(authFlowRedirectionURI: authFlowRedirectionURI)
 			}
 		} else {
-			// Restore pre-v0.54.8 behaviour: construct a default configuration from the issuer
-			// URL when no fallback service is registered, rather than throwing. This preserves
-			// the stateless flow — the caller is not required to pre-register any service.
+			// IBM patch: construct a default configuration from the issuer URL when no fallback
+			// service is registered, rather than throwing `.missingVciConfiguration` (upstream
+			// behaviour since v0.36.0). This preserves the stateless flow — the caller is not
+			// required to pre-register any service.
 			config = OpenId4VciConfiguration(credentialIssuerURL: urlString)
 		}
 		let vciService = try registerOpenId4VciService(name: urlString, config: config)

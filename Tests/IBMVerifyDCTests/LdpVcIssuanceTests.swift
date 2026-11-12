@@ -220,7 +220,7 @@ struct LdpVcIssuanceTests {
 		#expect(withoutMetadata.docTypeIdentifier == nil)
 	}
 
-	@Test("A document store holding an ldp_vc refreshes usage counters, reports a credential as available, is not presentable and can be deleted")
+	@Test("A document store holding an ldp_vc refreshes usage counters, reports a credential as available, is presentable without keys and can be deleted")
 	func storageWithKeylessDocument() async throws {
 		let storageService = RecordingStorageService()
 		let storage = StorageManager(storageService: storageService)
@@ -231,7 +231,7 @@ struct LdpVcIssuanceTests {
 		try await storage.refreshUsageCounters()
 		#expect(try await storage.getCredentialsUsageCount(id: doc.id) == nil)
 		#expect(try await storage.hasAnyCredential(id: doc.id))
-		#expect(try await storage.getDocIdsToPresentInfo(documents: [doc]).isEmpty)
+		#expect(try await storage.getDocIdsToPresentInfo(documents: [doc])[doc.id]?.docDataFormat == .ldpVc)
 		#expect(doc.getClaimDisplayNames(nil) == nil)
 
 		try await storage.deleteDocument(id: doc.id, status: .issued)

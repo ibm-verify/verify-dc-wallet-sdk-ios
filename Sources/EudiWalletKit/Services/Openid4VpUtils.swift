@@ -64,12 +64,19 @@ class OpenId4VpUtils {
 	}
 
 	/// Parse DCQL into request items (docType -> namespaced items), formats requested (docType -> dataFormat) and input descriptor map (docType -> credentialQueryId)
-	static func parseDcqlFormats(_ dcql: DCQL, idsToDocTypes: [Document.ID: DocType], logger: Logger? = nil) throws -> (formatsRequested: [DocType: DocDataFormat], inputDescriptorMap: [DocType: String], zkSpecsRequested: [DocType: [ZkSystemSpec]]?) {
+	static func parseDcqlFormats(_ dcql: DCQL, idsToDocTypes: [Document.ID: DocType], dataFormats: [Document.ID: DocDataFormat] = [:], logger: Logger? = nil) throws -> (formatsRequested: [DocType: DocDataFormat], inputDescriptorMap: [DocType: String], zkSpecsRequested: [DocType: [ZkSystemSpec]]?) {
 		var inputDescriptorMap = [DocType: String]()
 		var formatsRequested = [DocType: DocDataFormat]()
 		var zkSpecsRequested: [DocType: [ZkSystemSpec]]?
 		for credQuery in dcql.credentials {
 			let formatRequested: DocDataFormat = credQuery.dataFormat
+			if formatRequested == .ldpVc {
+				// ldp_vc documents are matched by credential type, not by doc type. Key the request by the stored doc type of each ldp_vc document
+				for (id, docType) in idsToDocTypes where dataFormats[id] == .ldpVc {
+					inputDescriptorMap[docType] = credQuery.id.value; formatsRequested[docType] = .ldpVc
+				}
+				continue
+			}
 			guard let docType = credQuery.docTypeOrVct else { continue }
 			if !idsToDocTypes.values.contains(docType) {logger?.warning("Document type \(docType) not in supported document types \(idsToDocTypes.values)")}
 			inputDescriptorMap[docType] = credQuery.id.value; formatsRequested[docType] = formatRequested
@@ -190,6 +197,51 @@ class OpenId4VpUtils {
 		}
 	}
 
+	/// Claim paths of an `ldp_vc` credential, rooted at the credential (OpenID4VP Appendix B.1.3.2).
+	/// Only leaves (scalars and empty containers) are recorded: `hasClaim` matches by prefix, so an intermediate node would match any deeper, non-existent path.
+	static func makeLdpVcClaimData(
+		from docsLdp: [Document.ID: JSON],
+		claimPaths: inout [Document.ID: [ClaimPath]],
+		claimValues: inout [Document.ID: [ClaimPath: [String]]]
+	) {
+		for (docId, credential) in docsLdp {
+			var paths = [ClaimPath](); var values = [ClaimPath: [String]]()
+			func walk(_ node: JSON, _ prefix: [ClaimPathElement]) {
+				switch node.type {
+				case .dictionary:
+					for (key, child) in node.dictionaryValue.sorted(by: { $0.key < $1.key }) { walk(child, prefix + [ClaimPathElement.claim(name: key)]) }
+					if node.dictionaryValue.isEmpty, !prefix.isEmpty { paths.append(ClaimPath(prefix)) }
+				case .array:
+					for (index, child) in node.arrayValue.enumerated() { walk(child, prefix + [ClaimPathElement.arrayElement(index: index)]) }
+					if node.arrayValue.isEmpty, !prefix.isEmpty { paths.append(ClaimPath(prefix)) }
+				default:
+					if !prefix.isEmpty { paths.append(ClaimPath(prefix)); values[ClaimPath(prefix)] = [node.stringValue] }
+				}
+			}
+			walk(credential, [])
+			claimPaths[docId] = paths
+			claimValues[docId] = values
+		}
+	}
+
+	/// The `type` values of an `ldp_vc` credential
+	static func ldpCredentialTypes(_ credential: JSON) -> [String] {
+		let type = credential["type"]
+		return type.type == .string ? [type.stringValue] : type.arrayValue.compactMap(\.string)
+	}
+
+	/// Local name of a type IRI: the part after the last `#` or `/`. Full JSON-LD context expansion is not performed
+	static func ldpLocalName(_ iri: String) -> String {
+		iri.split(whereSeparator: { $0 == "#" || $0 == "/" }).last.map(String.init) ?? iri
+	}
+
+	/// True if the credential `type` values satisfy any of the `type_values` alternatives (every type of the alternative must be present)
+	static func ldpTypesMatch(_ credentialTypes: [String], typeValues: [[String]]) -> Bool {
+		let names = Set(credentialTypes.map(ldpLocalName))
+		let full = Set(credentialTypes)
+		return typeValues.contains { alternative in alternative.allSatisfy { full.contains($0) || names.contains(ldpLocalName($0)) } }
+	}
+
 	/// parse claim-query and return (namespace, itemIdentifier) pair
 	static func parseClaim(_ claim: ClaimsQuery, _ docDataFormat: DocDataFormat) -> (String, RequestItem)? {
 		let elementPath = claim.path.value.map(\.claimName)
@@ -198,7 +250,7 @@ class OpenId4VpUtils {
 			let ns = elementPath.first!
 			let itemIdentifier = elementPath[1]
 			return (ns, RequestItem(elementPath: [itemIdentifier], intentToRetain: claim.intentToRetain, isOptional: false))
-		} else if docDataFormat == .sdjwt {
+		} else if docDataFormat == .sdjwt || docDataFormat == .ldpVc {
 			return ("", RequestItem(elementPath: elementPath, intentToRetain: false, isOptional: false))
 		}
 		return nil
@@ -252,7 +304,20 @@ extension ClaimPathElement {
 }
 
 extension CredentialQuery {
+	/// `meta.type_values` of an `ldp_vc` query: alternatives, each a set of type IRIs that must all be present
+	public var ldpTypeValues: [[String]]? {
+		let typeValues = meta["type_values"]
+		guard typeValues.type == .array else { return nil }
+		return typeValues.arrayValue.map { $0.arrayValue.compactMap(\.string) }
+	}
+
 	public var docTypeOrVct: String? {
+		if dataFormat == .ldpVc {
+			// display name of the requested ldp_vc type: the last type of the first alternative that is not the base type
+			guard let first = ldpTypeValues?.first else { return nil }
+			let names = first.map(OpenId4VpUtils.ldpLocalName)
+			return names.last { $0 != "VerifiableCredential" } ?? names.last
+		}
 		let mdocTypeValue = meta.dictionaryObject?["doctype_value"]
 		let vctValues = meta.dictionaryObject?["vct_values"]
 		let metaDocType = mdocTypeValue ?? vctValues ?? meta.dictionaryObject?.first?.value
@@ -268,7 +333,11 @@ extension CredentialQuery {
 	}
 
 	public var dataFormat: DocDataFormat {
-		format.format == "mso_mdoc" || format.format == "mso_mdoc_zk" ? .cbor : .sdjwt
+		switch format.format {
+		case "mso_mdoc", "mso_mdoc_zk": .cbor
+		case "ldp_vc": .ldpVc
+		default: .sdjwt
+		}
 	}
 }
 
@@ -342,9 +411,21 @@ extension OpenId4VpUtils {
 			let format = credQuery.dataFormat
 			let isMultiple = credQuery.multiple == true
 			// Find matching credentials
-			let matchingCredIds = queryable.getCredentials(docOrVctType: docType, docDataFormat: format)
+			let matchingCredIds: [Document.ID]
+			var holderBindingBlocked = false
+			if format == .ldpVc {
+				// ldp_vc documents hold no holder key, so they can only answer a query that does not require cryptographic holder binding
+				let typeMatches = queryable.getCredentials(ldpTypeValues: credQuery.ldpTypeValues ?? [])
+				holderBindingBlocked = credQuery.requireCryptographicHolderBinding != false && !typeMatches.isEmpty
+				matchingCredIds = holderBindingBlocked ? [] : typeMatches
+			} else {
+				matchingCredIds = queryable.getCredentials(docOrVctType: docType, docDataFormat: format)
+			}
 			let docTypeDisplayName = docTypeDisplayNames[docType] ?? docType
-			if matchingCredIds.isEmpty, dcql.credentialSets == nil { throw WalletError(description: "Credential of type \(docTypeDisplayName) cannot be found.", code: .credentialNotFound, context: ["docType": docType]) }
+			if matchingCredIds.isEmpty, dcql.credentialSets == nil {
+				if holderBindingBlocked { throw WalletError(description: "Credential of type \(docTypeDisplayName) cannot be presented: the verifier requires cryptographic holder binding, which ldp_vc credentials do not support.", code: .credentialNotFound, context: ["docType": docType]) }
+				throw WalletError(description: "Credential of type \(docTypeDisplayName) cannot be found.", code: .credentialNotFound, context: ["docType": docType])
+			}
 			// Try to find credentials that satisfy the claim requirements
 			for (credIndex, credId) in matchingCredIds.enumerated() {
 				do {

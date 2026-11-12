@@ -19,6 +19,7 @@ import OrderedCollections
 import MdocDataModel18013
 import MdocDataTransfer18013
 import eudi_lib_sdjwt_swift
+import SwiftyJSON
 import struct eudi_lib_sdjwt_swift.ClaimPath
 
 public struct DocPresentInfo: Sendable {
@@ -142,6 +143,20 @@ extension IssuerSigned {
 		let mandatoryElementKeys = MsoMdocElements.getMandatoryElementKeys(docType: docType, ns: ns)
 		let isMandatory: (RequestItem) -> Bool = { if let o = $0.isOptional { !o } else { mandatoryElementKeys.contains($0.rootIdentifier) } }
 		return NameSpacedElements(nameSpace: ns, elements: requestItems.map { $0.extractMsoMdocElement(ns: ns, nsItems: issuedItems, docClaims: docClaims, isMandatory: isMandatory($0)) })
+	}
+}
+
+extension SdJwtElements {
+	/// Elements for the consent view of an `ldp_vc` credential: the requested claim paths, or the credential's display claims when none were requested.
+	static func ldpVcElements(docId: String, docType: String, displayName: String?, credential: Data, docClaims: [DocClaim], itemsRequested: [RequestItem]) -> SdJwtElements? {
+		guard let json = try? JSON(data: credential), json.type == .dictionary else { return nil }
+		let items = itemsRequested.isEmpty ? docClaims.map { RequestItem(elementPath: $0.path) } : itemsRequested
+		let elements = items.map { item -> SdJwtElement in
+			let docClaim = item.findDocClaimByPath(docClaims: docClaims, requestPath: item.elementPath)
+			let jsonPath: [JSONSubscriptType] = item.elementPath.map { name -> JSONSubscriptType in if let index = Int(name) { index } else { name } }
+			return SdJwtElement(elementPath: item.elementPath, isOptional: item.isOptional ?? true, stringValue: docClaim?.stringValue, docClaim: docClaim, isValid: json[jsonPath].exists())
+		}
+		return SdJwtElements(docId: docId, vct: docType, displayName: displayName, sdJwtElements: elements)
 	}
 }
 

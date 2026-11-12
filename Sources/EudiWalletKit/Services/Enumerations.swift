@@ -36,6 +36,8 @@ extension SignedSDJWT: @retroactive @unchecked Sendable {}
 public enum DocTypedData: Sendable {
 	case msoMdoc(IssuerSigned)
 	case sdJwt(SignedSDJWT)
+	/// W3C JSON-LD credential (`ldp_vc`), as its raw JSON bytes
+	case ldpVc(Data)
 }
 
 public enum PopUsage: String, Sendable {

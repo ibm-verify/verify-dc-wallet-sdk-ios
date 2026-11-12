@@ -40,7 +40,9 @@ enum TransactionLogUtils {
 		var result = [ClaimInfo]()
 		for credential in dcql.credentials {
 			let identifiers: [String]
-			if let docType = credential.meta["doctype_value"].string {
+			if credential.dataFormat == .ldpVc {
+				identifiers = credential.docTypeOrVct.map { [$0] } ?? []
+			} else if let docType = credential.meta["doctype_value"].string {
 				identifiers = [docType]
 			} else {
 				identifiers = credential.meta["vct_values"].arrayValue.compactMap { $0.string }
@@ -48,7 +50,8 @@ enum TransactionLogUtils {
 			for identifier in identifiers {
 				var paths = credential.claims?.map { $0.path.mdocClaimPath } ?? []
 				if credential.claims?.isEmpty != false, let queryable {
-					paths = queryable.getCredentials(docOrVctType: identifier, docDataFormat: credential.dataFormat).sorted().flatMap {
+					let matches = credential.dataFormat == .ldpVc ? queryable.getCredentials(ldpTypeValues: credential.ldpTypeValues ?? []) : queryable.getCredentials(docOrVctType: identifier, docDataFormat: credential.dataFormat)
+					paths = matches.sorted().flatMap {
 						queryable.getAllClaimPaths(id: $0).map { $0.mdocClaimPath }
 					}
 				}

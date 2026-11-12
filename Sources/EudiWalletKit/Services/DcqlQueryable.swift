@@ -23,6 +23,8 @@ import struct OpenID4VP.ClaimPath
 public protocol DcqlQueryable {
 	/// retrieve credential identifiers matching docType and dataFormat
 	func getCredentials(docOrVctType: DocType, docDataFormat: DocDataFormat) -> [Document.ID]
+	/// retrieve `ldp_vc` credential identifiers whose `type` values satisfy any alternative of the query `meta.type_values`
+	func getCredentials(ldpTypeValues: [[String]]) -> [Document.ID]
 	/// retrieve all claim paths for a given credential identifier
 	func getAllClaimPaths(id: Document.ID) -> [ClaimPath]
 	/// check if a claim exists for a given credential identifier and claim path
@@ -31,15 +33,26 @@ public protocol DcqlQueryable {
 	func hasClaimWithValue(id: Document.ID, claimPath: ClaimPath, values: [String]) -> Bool
 }
 
+public extension DcqlQueryable {
+	func getCredentials(ldpTypeValues: [[String]]) -> [Document.ID] { [] }
+}
+
 public final class DefaultDcqlQueryable: DcqlQueryable, Sendable {
 	private let credentials: [Document.ID: (docType: DocType, format: DocDataFormat)]
 	private let claimPaths: [Document.ID: [ClaimPath]]
 	private let claimValues: [Document.ID: [ClaimPath: [String]]]
+	/// `type` values of each `ldp_vc` credential
+	private let ldpTypes: [Document.ID: [String]]
 
-	public init(credentials: [Document.ID: (DocType, DocDataFormat)], claimPaths: [Document.ID: [ClaimPath]], claimValues: [Document.ID: [ClaimPath: [String]]] = [:]) {
+	public init(credentials: [Document.ID: (DocType, DocDataFormat)], claimPaths: [Document.ID: [ClaimPath]], claimValues: [Document.ID: [ClaimPath: [String]]] = [:], ldpTypes: [Document.ID: [String]] = [:]) {
 		self.credentials = credentials
 		self.claimPaths = claimPaths
 		self.claimValues = claimValues
+		self.ldpTypes = ldpTypes
+	}
+
+	public func getCredentials(ldpTypeValues: [[String]]) -> [Document.ID] {
+		ldpTypes.filter { _, types in OpenId4VpUtils.ldpTypesMatch(types, typeValues: ldpTypeValues) }.map { $0.key }.sorted()
 	}
 
 	public func getCredentials(docOrVctType: DocType, docDataFormat: DocDataFormat) -> [Document.ID] {

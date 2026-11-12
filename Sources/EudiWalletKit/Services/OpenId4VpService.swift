@@ -25,6 +25,7 @@ import MdocSecurity18013
 import MdocDataTransfer18013
 import WalletStorage
 import OpenID4VP
+import SwiftyJSON
 import protocol OpenID4VP.Networking
 import eudi_lib_sdjwt_swift
 import JOSESwift
@@ -201,7 +202,8 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 					if case .rejected = outcome { logger.warning("Verifier rejected error response") }
 				} catch { logger.error("Failed to dispatch error response: \(error.localizedDescription)") }
 			}
-			throw WalletError(description: "OpenID4VP request error: \(readerCertificateValidationMessage ?? error.errorDescription ?? error.localizedDescription)", code: readerCertificateValidationMessage != nil ? .trustError : Self.walletErrorCode(error), innerError: error)
+			let trustMessage = readerCertificateAccepted ? nil : readerCertificateValidationMessage
+			throw WalletError(description: "OpenID4VP request error: \(trustMessage ?? error.errorDescription ?? error.localizedDescription)", code: trustMessage != nil ? .trustError : Self.walletErrorCode(error), innerError: error)
 		case let .jwt(request: rrd, warnings):
 			self.wrpVerifierWarnings = await wrpRegistrationValidator.wrpVpWarnings
 			if !warnings.isEmpty { logger.warning("Policy warnings: \(warnings.mapValues{$0.map(\.violation)})") }
@@ -281,12 +283,14 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 				name: TransactionLogUtils.verifierName(legalName: rrd.legalName, certificateSubject: readerCertificateIssuer), identifier: resolvedClientId, transactionalData: try transactionData.map { try TransactionalData(content: $0.map { try $0.decode() }) }, transactionLog: &transactionLog)
 			await persistTransactionLog()
 			let deviceRequestBytes = try? JSONEncoder().encode(dcql)
-			let (fmtsReq, imap, zkSpecMap) = try OpenId4VpUtils.parseDcqlFormats(dcql, idsToDocTypes: transferInfo.idsToDocTypes, logger: logger)
+			let (fmtsReq, imap, zkSpecMap) = try OpenId4VpUtils.parseDcqlFormats(dcql, idsToDocTypes: transferInfo.idsToDocTypes, dataFormats: transferInfo.dataFormats, logger: logger)
 			formatsRequested = fmtsReq; inputDescriptorMap = imap; zkSpecsRequested = zkSpecMap
 			dcqlQueryable = decodeDocuments()
 			parsedTransactionData = try (transactionData ?? []).map { try PresentationTransactionData(encodedValue: $0.value) }
 			let mdocKeyAuthorizations = (docsCbor ?? [:]).compactMapValues { $0.issuerAuth.mso.deviceKeyInfo.keyAuthorizations }
 			let eligibleIds = Set(transferInfo.documentObjects.compactMap { id, data -> String? in
+				// ldp_vc documents hold no holder key; they are returned unbound and are never eligible for transaction data
+				if transferInfo.dataFormats[id] == .ldpVc { return nil }
 				guard transferInfo.privateKeyObjects[id] != nil else { return nil }
 				if transferInfo.dataFormats[id] == .cbor { return mdocKeyAuthorizations[id] != nil ? id : nil }
 				guard transferInfo.dataFormats[id] == .sdjwt,
@@ -300,6 +304,7 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 				for query in dcql.credentials where transaction.credentialIds.contains(query.id.value) {
 					try requireQes(query.requireCryptographicHolderBinding != false, "Transaction data requires holder binding")
 					let format = query.dataFormat
+					try requireQes(format != .ldpVc, "Transaction data is not supported for ldp_vc credentials")
 					guard let docType = query.docTypeOrVct else { continue }
 					for id in dcqlQueryable.getCredentials(docOrVctType: docType, docDataFormat: format) where eligibleIds.contains(id) &&
 						TransactionDataProcessor.canAuthorize(transaction, documentId: id, mdocKeyAuthorizations: mdocKeyAuthorizations, supportedTypes: openID4VpConfig.supportedTransactionDataTypes) {
@@ -346,6 +351,27 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 			}
 			return results
 		} else { throw WalletError(description: "Unsupported presentation query", code: .invalidQueryResolution) }
+	}
+
+	/// An unsigned Verifiable Presentation holding the credential as its single `verifiableCredential` entry.
+	/// The verifier gateway rejects a bare credential ("must have one 'verifiableCredential' entry"). The wallet holds no holder key, so there is no `proof`.
+	static func ldpVcPresentation(wrapping credential: JSON) -> JSON {
+		let context = credential["@context"].array?.first?.string ?? "https://www.w3.org/ns/credentials/v2"
+		return JSON(["@context": [context], "type": ["VerifiablePresentation"], "verifiableCredential": [credential.object]])
+	}
+
+	/// Claim paths recorded in the transaction log for a returned ldp_vc: the requested ones, or all when none were requested.
+	/// The whole credential is returned, since its proof covers all of it.
+	static func ldpVcPresentedClaims(_ credential: JSON, docType: String, items: [RequestItem]) -> [ClaimInfo] {
+		var paths: [MdocDataModel18013.ClaimPath]
+		if items.isEmpty {
+			var claimPaths = [Document.ID: [ClaimPath]](); var claimValues = [Document.ID: [ClaimPath: [String]]]()
+			OpenId4VpUtils.makeLdpVcClaimData(from: ["ldp": credential], claimPaths: &claimPaths, claimValues: &claimValues)
+			paths = (claimPaths["ldp"] ?? []).map(\.mdocClaimPath)
+		} else {
+			paths = items.map { item in MdocDataModel18013.ClaimPath(item.elementPath.map { Int($0).map { .arrayElement(index: $0) } ?? .claim(name: $0) }) }
+		}
+		return [ClaimInfo(credentialIdentifier: docType, claims: paths)]
 	}
 
 	fileprivate func makeCborDocs() {
@@ -406,6 +432,10 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 			formatsRequested = fmts
 		}
 		if formatsRequested.first(where: { (_, value: DocDataFormat) in value == .cbor }) != nil { makeCborDocs() }
+		let docsLdp: [Document.ID: JSON] = transferInfo.documentObjects.filter { transferInfo.dataFormats[$0.key] == .ldpVc }.compactMapValues { data in
+			guard let json = try? JSON(data: data), json.type == .dictionary else { return nil }
+			return json
+		}
 		let parser = CompactParser()
 		let docJwtStrings = transferInfo.documentObjects.filter { k,v in Self.filterFormat(transferInfo.dataFormats[k]!, fmt: .sdjwt)}.compactMapValues { String(data: $0, encoding: .utf8) }
 		docsSdJwt = docJwtStrings.compactMapValues { try? parser.getSignedSdJwt(serialisedString: $0) }
@@ -418,7 +448,9 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 		var claimValues = [Document.ID: [ClaimPath: [String]]]()
 		OpenId4VpUtils.makeCborClaimData(from: docsCbor, claimPaths: &claimPaths, claimValues: &claimValues)
 		OpenId4VpUtils.makeSdJwtClaimData(from: docsSdJwt, claimPaths: &claimPaths, claimValues: &claimValues)
-		let defaultDcqlQueryable = DefaultDcqlQueryable(credentials: credentialMap, claimPaths: claimPaths, claimValues: claimValues)
+		OpenId4VpUtils.makeLdpVcClaimData(from: docsLdp, claimPaths: &claimPaths, claimValues: &claimValues)
+		let ldpTypes = docsLdp.mapValues { OpenId4VpUtils.ldpCredentialTypes($0) }
+		let defaultDcqlQueryable = DefaultDcqlQueryable(credentials: credentialMap, claimPaths: claimPaths, claimValues: claimValues, ldpTypes: ldpTypes)
 		return defaultDcqlQueryable
 	}
 
@@ -493,6 +525,17 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 					allSelectedClaimsPresented = allSelectedClaimsPresented && vpToken.5
 					if !vpToken.4.isEmpty { preparedIds.append(docId) }
 					inputToPresentations.append((inputDescrId, docId, vpToken.0))
+				} else if transferInfo.dataFormats[docId] == .ldpVc {
+					// ldp_vc: unbound credential returned as-is. A holder-signed presentation is not supported (the document has no holder key)
+					guard let docData = transferInfo.documentObjects[docId], let credential = try? JSON(data: docData), credential.type == .dictionary else {
+						throw WalletError(description: "Stored ldp_vc credential \(docId) cannot be read", code: .internalError)
+					}
+					guard dcql?.findQuery(id: inputDescrId)?.requireCryptographicHolderBinding == false else {
+						throw WalletError(description: "ldp_vc credential cannot be presented to a verifier that requires holder binding", code: .dcqlQueryNotSatisfied)
+					}
+					presentedClaims.append(contentsOf: Self.ldpVcPresentedClaims(credential, docType: docType, items: nsItems.first?.value ?? []))
+					preparedIds.append(docId)
+					inputToPresentations.append((inputDescrId, docId, VerifiablePresentation.json(Self.ldpVcPresentation(wrapping: credential))))
 				} else if transferInfo.dataFormats[docId] == .sdjwt {
 					let docSigned = docsSdJwt[docId]; let dpk = transferInfo.privateKeyObjects[docId]
 					let docData = transferInfo.documentObjects[docId]
@@ -612,13 +655,15 @@ public final class OpenId4VpService: @unchecked Sendable, PresentationService {
 				case .preregistered(let clients): .preregistered(clients: Dictionary(uniqueKeysWithValues: clients.map { ($0.clientId, $0) }))
 			}
 		}
+		// The library default covers dc+sd-jwt and mso_mdoc; add ldp_vc so ldp_vc DCQL queries pass wallet-side format validation.
+		let walletVpFormats = try! VpFormatsSupported(values: VpFormatsSupported.default().values + [.ldpVc(proofTypes: nil, cryptosuites: nil)])
 		let res = OpenId4VPConfiguration(
 			privateKey: privateKey,
 			publicWebKeySet: keySet,
 			supportedClientIdSchemes: supportedClientIdPrefixes,
 			vpFormatsSupported: [],
 			jarConfiguration: .encryptionOption,
-			vpConfiguration: try! .init(vpFormatsSupported: .default(), supportedTransactionDataTypes: openID4VpConfig.supportedTransactionDataTypes),
+			vpConfiguration: try! .init(vpFormatsSupported: walletVpFormats, supportedTransactionDataTypes: openID4VpConfig.supportedTransactionDataTypes),
 			errorDispatchPolicy: openID4VpConfig.errorDispatchPolicy,
 			session: networking,
 			responseEncryptionConfiguration: openID4VpConfig.responseEncryptionConfiguration ?? .default(),
@@ -733,6 +778,11 @@ struct OpenID4VPNetworking: Networking {
 	}
 
 	func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-		try await networking.data(for: request)
+		let (data, response) = try await networking.data(for: request)
+		// the library reduces a rejected response post to a bare failure; keep the verifier's reason in the log
+		if request.httpMethod == "POST", let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+			Logger(label: "OpenID4VPNetworking").warning("POST \(request.url?.absoluteString ?? "") returned HTTP \(http.statusCode): \(String(data: data.prefix(2000), encoding: .utf8) ?? "<\(data.count) bytes>")")
+		}
+		return (data, response)
 	}
 }

@@ -233,16 +233,19 @@ public final class StorageManager: ObservableObject, @unchecked Sendable {
 	public func getDocIdsToPresentInfo(documents: [WalletStorage.Document]? = nil) async throws -> [String: DocPresentInfo] {
 		let docs = if let documents { documents } else { try? await storageService.loadDocuments(status: .issued) }
 		let dictValues = await docModels.asyncCompactMap { m -> (String, DocPresentInfo)? in
-			guard let doc = docs?.first(where: { $0.id == m.id }), let dki = DocKeyInfo(from: doc.docKeyInfo) else { return nil }
+			// ldp_vc documents have no holder key info
+			guard let doc = docs?.first(where: { $0.id == m.id }) else { return nil }
+			let dki = DocKeyInfo(from: doc.docKeyInfo)
+			guard dki != nil || m.docDataFormat == .ldpVc else { return nil }
 			let bValid = (try? await hasAnyCredential(id: m.id)) ?? false
 			guard bValid else { return nil }
 			let docTypedData: DocTypedData? = switch m.docDataFormat {
 				case .cbor: if let iss = try? IssuerSigned(data: doc.data.bytes) { .msoMdoc(iss) } else { nil }
 				case .sdjwt: if let serString = String(data: doc.data, encoding: .utf8), let sd = try? CompactParser().getSignedSdJwt(serialisedString: serString) { .sdJwt(sd) } else { nil }
-				case .ldpVc: nil // presenting an ldp_vc is not supported
+				case .ldpVc: .ldpVc(doc.data)
 			}
 			guard let docTypedData else { return nil }
-			let presentInfo = DocPresentInfo(docType: m.docType, secureAreaName: dki.secureAreaName, docDataFormat: m.docDataFormat, displayName: m.displayName, docClaims: m.docClaims, typedData: docTypedData)
+			let presentInfo = DocPresentInfo(docType: m.docType, secureAreaName: dki?.secureAreaName, docDataFormat: m.docDataFormat, displayName: m.displayName, docClaims: m.docClaims, typedData: docTypedData)
 			return (m.id, presentInfo)
 		}
 		return Dictionary(uniqueKeysWithValues: dictValues)

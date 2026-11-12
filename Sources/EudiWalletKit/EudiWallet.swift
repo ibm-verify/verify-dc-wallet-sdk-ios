@@ -667,7 +667,9 @@ public final class EudiWallet: ObservableObject, @unchecked Sendable {
 			docData[doc0.id] = doc?.data
 			documentKeyIndexes[doc0.id] = doc?.keyIndex
 		}
-		docData = docData.filter { docKeyInfos[$0.key] != nil }
+		// ldp_vc documents have no holder key, but are still presentable (as an unbound credential)
+		let keylessIds = Set(docs.filter { $0.docDataFormat == .ldpVc }.map(\.id))
+		docData = docData.filter { docKeyInfos[$0.key] != nil || keylessIds.contains($0.key) }
 		guard idsToDocData.count > 0 else {
 			// TODO: localizationKey is kept for backward compatibility — clients can migrate to use `code` instead
 			throw WalletError(description: PresentationSession.notAvailableStr, localizationKey: "request_data_no_document", code: .noDocumentsAvailable)

@@ -127,6 +127,12 @@ public final class PresentationSession: @unchecked Sendable, ObservableObject {
 						let sdJwtElements = signedSdJwt.extractSdJwtElements(docId: docId, vct: docType, displayName: docPresentInfo.displayName, docClaims: docPresentInfo.docClaims, itemsRequested: sdItemsRequested)
 						guard let sdJwtElements else { continue }
 						disclosedElements.append(.sdJwt(sdJwtElements))
+					case .ldpVc:
+						// ldp_vc is shown with the path-based element model of SD-JWT. The whole credential is shared, whatever is listed here
+						guard case let .ldpVc(credentialData) = docPresentInfo.typedData else { continue }
+						guard let ldpItemsRequested = request.itemsRequested[docId] ?? request.itemsRequested[docType] else { continue }
+						guard let ldpElements = SdJwtElements.ldpVcElements(docId: docId, docType: docType, displayName: docPresentInfo.displayName, credential: credentialData, docClaims: docPresentInfo.docClaims, itemsRequested: ldpItemsRequested[""] ?? []) else { continue }
+						disclosedElements.append(.sdJwt(ldpElements))
 					default: logger.error("Unsupported format \(docPresentInfo.docDataFormat) for \(docId)")
 				}
 			}
@@ -227,6 +233,7 @@ public final class PresentationSession: @unchecked Sendable, ObservableObject {
 	func updateKeyBatchInfoAndDeleteCredentialIfNeeded(presentedIds: [Document.ID], zkpDocumentIds: [Document.ID]?) async throws {
 		for (id, dpi) in docIdToPresentInfo where presentedIds.contains(id) {
 			if let zkpDocumentIds, zkpDocumentIds.contains(id) { continue }
+			if dpi.docDataFormat == .ldpVc { continue } // no holder keys, hence no key batch to update
 			let secureArea = SecureAreaRegistry.shared.get(name: dpi.secureAreaName)
 			guard let keyIndex = documentKeyIndexes[id] else { continue }
 			let newKeyBatchInfo = try await secureArea.updateKeyBatchInfo(id: id, keyIndex: keyIndex)

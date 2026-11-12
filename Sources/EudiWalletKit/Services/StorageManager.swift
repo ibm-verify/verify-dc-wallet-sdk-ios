@@ -20,6 +20,7 @@ import MdocDataModel18013
 import WalletStorage
 import Logging
 import eudi_lib_sdjwt_swift
+import SwiftyJSON
 import OpenID4VCI
 
 /// Storage manager. Provides services and view models
@@ -129,7 +130,8 @@ public final class StorageManager: ObservableObject, @unchecked Sendable {
 	/// When a value changes, assigning through `setUsageCount` updates the model's
 	/// published property so observers of the `DocClaimsModel` are notified.
 	public func refreshUsageCounters() async throws {
-		let modelInfos = await MainActor.run { docModels.map { ($0.id, $0.secureAreaName) } }
+		// ldp_vc documents have no holder keys, hence no key batch info
+		let modelInfos = await MainActor.run { docModels.filter { $0.docDataFormat != .ldpVc }.map { ($0.id, $0.secureAreaName) } }
 		for (id, secureAreaName) in modelInfos {
 			let usageCount = try await Self.getCredentialsUsageCount(id: id, secureAreaName: secureAreaName)
 			await setUsageCount(usageCount, id: id)
@@ -147,9 +149,33 @@ public final class StorageManager: ObservableObject, @unchecked Sendable {
 		let model: DocClaimsModel? = switch doc.docDataFormat {
 		case .cbor: toCborMdocModel(doc: doc, uiCulture: uiCulture, modelFactory: modelFactory)
 		case .sdjwt: SdJwtUtils.toSdJwtDocModel(doc: doc, uiCulture: uiCulture, modelFactory: modelFactory)
+		case .ldpVc: toLdpVcModel(doc: doc, uiCulture: uiCulture)
 		}
 		guard let model else { return nil }
 		return reorderDocClaimsByMetadata(model, doc: doc, uiCulture: uiCulture)
+	}
+
+	/// Parses an RFC 3339 timestamp, with or without fractional seconds (issuers send both, e.g. `2026-11-12T02:04:02.685Z`).
+	private static func parseLdpVcDate(_ string: String) -> Date? {
+		let formatter = ISO8601DateFormatter()
+		for options: ISO8601DateFormatter.Options in [.withInternetDateTime, [.withInternetDateTime, .withFractionalSeconds]] {
+			formatter.formatOptions = options
+			if let date = formatter.date(from: string) { return date }
+		}
+		return nil
+	}
+
+	/// Minimal display model of an `ldp_vc` document: the claims of `credentialSubject`, without holder keys or signature checks.
+	static func toLdpVcModel(doc: WalletStorage.Document, uiCulture: String?) -> DocClaimsModel? {
+		guard let json = try? JSON(data: doc.data), json.type == .dictionary else { logger.error("Could not decode ldp_vc document \(doc.id)"); return nil }
+		let docMetadata: DocMetadata? = DocMetadata(from: doc.metadata)
+		let md = docMetadata?.getMetadata(uiCulture: uiCulture)
+		let subject = json["credentialSubject"].type == .array ? json["credentialSubject"].arrayValue.first ?? JSON() : json["credentialSubject"]
+		let docClaims = (subject.toClaimsArray(pathPrefix: ["credentialSubject"], md?.claimMetadata, uiCulture)?.0 ?? []).filter { $0.name != "type" } // the subject's JSON-LD type is not a displayable claim
+		let date: (String...) -> Date? = { keys in keys.lazy.compactMap { json[$0].string }.compactMap(Self.parseLdpVcDate).first }
+		let docKeyInfo = DocKeyInfo(from: doc.docKeyInfo) ?? .default
+		let configuration = DocClaimsModelConfiguration(id: doc.id, createdAt: doc.createdAt, docType: doc.docType, displayName: docMetadata?.getDisplayName(uiCulture), display: docMetadata?.display, issuerDisplay: docMetadata?.issuerDisplay, credentialIssuerIdentifier: md?.credentialIssuerIdentifier, configurationIdentifier: md?.configurationIdentifier, validFrom: date("validFrom", "issuanceDate"), validUntil: date("validUntil", "expirationDate"), statusList: nil, credentialsUsageCounts: nil, credentialPolicy: docKeyInfo.credentialPolicy, secureAreaName: docKeyInfo.secureAreaName, modifiedAt: doc.modifiedAt, docClaims: docClaims, docDataFormat: .ldpVc, hashingAlg: nil)
+		return DocClaimsModel(configuration: configuration)
 	}
 
 	public static func toCborMdocModel(doc: WalletStorage.Document, uiCulture: String?, modelFactory: (any DocClaimsDecodableFactory)? = nil) -> DocClaimsModel? {
@@ -213,6 +239,7 @@ public final class StorageManager: ObservableObject, @unchecked Sendable {
 			let docTypedData: DocTypedData? = switch m.docDataFormat {
 				case .cbor: if let iss = try? IssuerSigned(data: doc.data.bytes) { .msoMdoc(iss) } else { nil }
 				case .sdjwt: if let serString = String(data: doc.data, encoding: .utf8), let sd = try? CompactParser().getSignedSdJwt(serialisedString: serString) { .sdJwt(sd) } else { nil }
+				case .ldpVc: nil // presenting an ldp_vc is not supported
 			}
 			guard let docTypedData else { return nil }
 			let presentInfo = DocPresentInfo(docType: m.docType, secureAreaName: dki.secureAreaName, docDataFormat: m.docDataFormat, displayName: m.displayName, docClaims: m.docClaims, typedData: docTypedData)
@@ -227,6 +254,7 @@ public final class StorageManager: ObservableObject, @unchecked Sendable {
 	}
 
 	public func getCredentialsUsageCount(id: String) async throws -> CredentialsUsageCounts? {
+		if getDocumentModel(id: id)?.docDataFormat == .ldpVc { return nil }
 		let secureAreaName = getDocumentModel(id: id)?.secureAreaName
 		return try await Self.getCredentialsUsageCount(id: id, secureAreaName: secureAreaName)
 	}

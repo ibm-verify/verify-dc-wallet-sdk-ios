@@ -99,6 +99,9 @@ public actor OpenId4VciService {
 
 	// create batch keys and return the binding keys and the `CoseKey` public keys in cbor format
 	func initSecurityKeys(_ configuration: CredentialConfiguration, clientId: String) async throws -> ([BindingKey], [Data]) {
+		// ldp_vc: no holder binding. The library sends no proofs and `credentialSigningAlgValuesSupported` holds cryptosuites, not JWS algorithms
+		guard configuration.requiresHolderBinding else { return ([], []) }
+
 		let algSupported = Set(configuration.credentialSigningAlgValuesSupported)
 		// Convert credential issuer supported algorithms to JWSAlgorithm types
 		let algTypes = algSupported.compactMap { JWSAlgorithm.AlgorithmType(rawValue: $0) }
@@ -645,6 +648,10 @@ public actor OpenId4VciService {
 			let proofTypesSupported = sdJwtVc.proofTypesSupported ?? [:]
 			let (jwtProofType, _, _, supportsAttestationProofType, supportsJwtProofTypeWithAttestation) = resolveProofTypeAttestationSupport(proofTypesSupported: proofTypesSupported)
 			return CredentialConfiguration(configurationIdentifier: credential.key, credentialIssuerIdentifier: credentialIssuerIdentifier, docType: nil, vct: sdJwtVc.vct, scope: sdJwtVc.scope,  supportsAttestationProofType: supportsAttestationProofType, supportsJwtProofTypeWithAttestation: supportsJwtProofTypeWithAttestation, credentialSigningAlgValuesSupported: jwtProofType?.algorithms ?? [], dpopSigningAlgValuesSupported: dpopSigningAlgValuesSupported, clientAttestationPopSigningAlgValuesSupported: clientAttestationPopSigningAlgValuesSupported, issuerDisplay: issuerDisplay.map(\.displayMetadata), display: sdJwtVc.credentialMetadata?.display.map(\.displayMetadata) ?? [], claims: sdJwtVc.credentialMetadata?.claims ?? [], credentialMetadata: sdJwtVc.credentialMetadata, format: .sdjwt, defaultCredentialOptions: try resolveCredentialOptions(batchCredentialIssuance: batchCredentialIssuance, credentialReusePolicy: sdJwtVc.credentialMetadata?.credentialReusePolicy))
+		} else if case let credentials = credentialsSupported.filter({ if case .w3CJsonLdDataIntegrity = $0.value, identifier != nil, $0.key.value == identifier { true } else { false } }), let credential = credentials.first, case let .w3CJsonLdDataIntegrity(ldpVc) = credential.value {
+			// ldp_vc: matched by configuration identifier only. `credentialSigningAlgValuesSupported` holds cryptosuites, not JWS algorithms, so it is not propagated
+			logger.info("ldp_vc with identifier: \(credential.key.value), scope: \(String(describing: ldpVc.scope)), cryptosuites: \(ldpVc.credentialSigningAlgValuesSupported)")
+			return CredentialConfiguration(configurationIdentifier: credential.key, credentialIssuerIdentifier: credentialIssuerIdentifier, docType: nil, vct: nil, scope: ldpVc.scope, supportsAttestationProofType: false, supportsJwtProofTypeWithAttestation: false, credentialSigningAlgValuesSupported: [], dpopSigningAlgValuesSupported: dpopSigningAlgValuesSupported, clientAttestationPopSigningAlgValuesSupported: clientAttestationPopSigningAlgValuesSupported, issuerDisplay: issuerDisplay.map(\.displayMetadata), display: ldpVc.credentialMetadata?.display.map(\.displayMetadata) ?? [], claims: (ldpVc.credentialMetadata?.claims).flatMap { $0.isEmpty ? nil : $0 } ?? ldpVc.credentialDefinition.claims, credentialMetadata: ldpVc.credentialMetadata, format: .ldpVc, defaultCredentialOptions: try resolveCredentialOptions(batchCredentialIssuance: batchCredentialIssuance, credentialReusePolicy: nil))
 		}
 		let requestedParams = [docType.map { "docType: \($0)" }, vct.map { "vct: \($0)" }, identifier.map { "identifier: \($0)" }].compactMap { $0 }.joined(separator: ", ")
 		logger.error("No credential configuration found with \(requestedParams). Available credential identifiers: \(credentialsSupported.keys.map(\.value).joined(separator: ", "))")
@@ -699,6 +706,11 @@ public actor OpenId4VciService {
 				let dco = try resolveCredentialOptions(batchCredentialIssuance: batchCredentialIssuance, credentialReusePolicy: sdJwtVc.credentialMetadata?.credentialReusePolicy)
 				let offered = OfferedDocModel(credentialConfigurationIdentifier: credential.key.value, docType: nil, vct: sdJwtVc.vct, scope: sdJwtVc.scope, identifier: credential.key.value, displayName: sdJwtVc.credentialMetadata?.display.map(\.displayMetadata).getName(uiCulture) ?? "", algValuesSupported: sdJwtVc.credentialSigningAlgValuesSupported, claims: sdJwtVc.credentialMetadata?.claims ?? [], credentialMetadata: sdJwtVc.credentialMetadata, credentialOptions: dco, keyOptions: nil)
 				credentialInfos.append((identifier: credential.key, scope: sdJwtVc.scope, offered: offered))
+			} else if case .w3CJsonLdDataIntegrity(let ldpVc) = credential.value {
+				let dco = try resolveCredentialOptions(batchCredentialIssuance: batchCredentialIssuance, credentialReusePolicy: nil)
+				let typeName = ldpVc.credentialDefinition.type.last { $0 != "VerifiableCredential" }
+				let offered = OfferedDocModel(credentialConfigurationIdentifier: credential.key.value, docType: nil, vct: nil, scope: ldpVc.scope, identifier: credential.key.value, displayName: ldpVc.credentialMetadata?.display.map(\.displayMetadata).getName(uiCulture) ?? typeName ?? credential.key.value, algValuesSupported: [], claims: (ldpVc.credentialMetadata?.claims).flatMap { $0.isEmpty ? nil : $0 } ?? ldpVc.credentialDefinition.claims, credentialMetadata: ldpVc.credentialMetadata, credentialOptions: dco, keyOptions: nil)
+				credentialInfos.append((identifier: credential.key, scope: ldpVc.scope, offered: offered))
 			}
 		}
 		return credentialInfos
@@ -770,13 +782,25 @@ public actor OpenId4VciService {
 		}
 	}
 
-	private static func handleCredentialResponse(credentials: [Credential], publicKeys: [Data], configuration: CredentialConfiguration, authorized: AuthorizedRequest, notificationId: String?, logger: Logger) async throws -> IssuanceOutcome {
+	static func handleCredentialResponse(credentials: [Credential], publicKeys: [Data], configuration: CredentialConfiguration, authorized: AuthorizedRequest, notificationId: String?, logger: Logger) async throws -> IssuanceOutcome {
 		let toData: (String) -> Data = { str in
 			logger.notice(configuration.format == .cbor ? "Base64URL mdoc data:\n\(str)" : "sd-jwt credential data:\n\(str)")
 			if configuration.format == .cbor { return Data(base64URLEncoded: str) ?? Data() } else { return str.data(using: .utf8) ?? Data() }
 		}
 		let credData: [(Data, Data)] = try credentials.enumerated().flatMap { index, credential in
-		if case let .string(str) = credential  {
+		if configuration.format == .ldpVc {
+			// ldp_vc: each credential is a JSON-LD object, as a JSON object, a string holding JSON, or wrapped as `[{"credential": …}]`. It is stored as its raw JSON bytes. There are no holder keys
+			let json: JSON
+			if case let .json(j) = credential { json = j } else if case let .string(str) = credential { json = JSON(parseJSON: str) } else { json = JSON.null }
+			let wrapped = json.type == .array ? json.arrayValue.map { $0["credential"].exists() ? $0["credential"] : $0 } : [json]
+			return try wrapped.enumerated().map { offset, element in
+				let object = element.type == .string ? JSON(parseJSON: element.stringValue) : element
+				guard object.type == .dictionary else { throw WalletError(description: "Invalid ldp_vc credential: expected a JSON object, got \(object.type)", code: .issuanceRequestFailed) }
+				let data = try object.rawData()
+				logger.notice("Issued ldp_vc credential data:\n\(String(data: data, encoding: .utf8) ?? "")")
+				return (data, publicKeys.indices.contains(offset) ? publicKeys[offset] : Data())
+			}
+		} else if case let .string(str) = credential  {
 			logger.notice("Issued credential data:\n\(str)")
 			return [(toData(str), publicKeys[index])]
 		} else if case let .json(json) = credential, json.type == .array, json.first != nil {
@@ -1094,7 +1118,8 @@ public actor OpenId4VciService {
 			let pds = issueOutcome.pendingOrDeferredStatus
 			var batch: [WalletStorage.Document]?
 			var publicKeys: [Data] = []
-			var dkInfo = DocKeyInfo(secureAreaName: issueReq.secureAreaName, batchSize: 0, credentialPolicy: issueReq.credentialOptions.credentialPolicy)
+			// ldp_vc has no holder keys, so no key info for any status (delete would otherwise look for a key batch that does not exist)
+			var dkInfo: DocKeyInfo? = format == .ldpVc ? nil : DocKeyInfo(secureAreaName: issueReq.secureAreaName, batchSize: 0, credentialPolicy: issueReq.credentialOptions.credentialPolicy)
 			switch issueOutcome {
 			case .issued(let dataPairs, let cc, let authorized, let notificationId):
 				// Capture for potential failure notification outside switch scope
@@ -1103,11 +1128,11 @@ public actor OpenId4VciService {
 				guard dataPairs.first != nil else { throw WalletError(description: "Empty issued data array", code: .internalError) }
 				dataToSave = issueOutcome.getDataToSave(index: 0, format: format)
 				docMetadata = cc.convertToDocMetadata(authorized: authorized, keyOptions: issueReq.keyOptions, credentialOptions: issueReq.credentialOptions)
-				let docTypeOrVctOrScope = docType ?? cc.docType ?? cc.scope ?? ""
-				dkInfo.batchSize = dataPairs.count
+				let docTypeOrVctOrScope = docType ?? cc.docType ?? cc.scope ?? (format == .ldpVc ? cc.configurationIdentifier.value : "")
+				dkInfo?.batchSize = dataPairs.count
 				docTypeToSave = if format == .cbor, dataToSave.count > 0 { (try IssuerSigned(data: [UInt8](dataToSave))).issuerAuth.mso.docType } else if format == .sdjwt, dataToSave.count > 0 { SdJwtUtils.getVctFromSdJwt(docData: dataToSave) ?? docTypeOrVctOrScope } else { docTypeOrVctOrScope }
 				displayName = cc.display.getName(uiCulture)
-				if dataPairs.count > 0 {
+				if cc.requiresHolderBinding, dataPairs.count > 0 {
 					batch = (0..<dataPairs.count).map { WalletStorage.Document(id: issueReq.id, docType: docTypeToSave, docDataFormat: format, data: issueOutcome.getDataToSave(index: $0, format: format), docKeyInfo: nil, createdAt: Date(), metadata: nil, displayName: displayName, status: .issued) }
 					publicKeys = dataPairs.map(\.publicKey)
 				}
@@ -1125,7 +1150,7 @@ public actor OpenId4VciService {
 			// Download credential display images eagerly at issuance time.
 			docMetadata = await docMetadata.downloadingDisplayImages(networking: networking)
 			let newDocStatus: WalletStorage.DocumentStatus = issueOutcome.isDeferred ? .deferred : (issueOutcome.isPending ? .pending : .issued)
-			let newDocument = WalletStorage.Document(id: issueReq.id, docType: docTypeToSave, docDataFormat: format, data: dataToSave, docKeyInfo: dkInfo.toData(), createdAt: Date(), metadata: docMetadata.toData(), displayName: displayName, status: newDocStatus)
+			let newDocument = WalletStorage.Document(id: issueReq.id, docType: docTypeToSave, docDataFormat: format, data: dataToSave, docKeyInfo: dkInfo?.toData(), createdAt: Date(), metadata: docMetadata.toData(), displayName: displayName, status: newDocStatus)
 			if newDocStatus == .pending {
 				await logIssuanceTransaction(id: transactionId, status: .notCompleted, requested: 1,
 					issuerName: issuerName, issuerIdentifier: issuerIdentifier, reissuance: deleteId != nil, errorMessage: "Issuance pending")
@@ -1223,6 +1248,11 @@ public actor OpenId4VciService {
 	}
 
 	func validateIssuedDocuments(_ issued: WalletStorage.Document, batch: [WalletStorage.Document]?, publicKeys: [Data]) async throws {
+		if issued.docDataFormat == .ldpVc {
+			// TODO: verify the Data Integrity proof of the issued ldp_vc credential
+			logger.warning("ldp_vc credential \(issued.id) is stored WITHOUT issuer signature verification")
+			return
+		}
 		var pkCoseKeys = publicKeys.compactMap { try? CoseKey(data: [UInt8]($0)) }
 		guard pkCoseKeys.count == publicKeys.count else { throw WalletError(description: "Failed to parse public keys", code: .internalError) }
 		for doc in (batch ?? [issued]) {

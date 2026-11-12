@@ -25,7 +25,7 @@ Enabling this flag accepts all supported proof types using ES256, ES384, or ES51
 
 When the document docType to be issued use the `issueDocuments(issuerName:docTypeIdentifiers:credentialOptions:keyOptions:promptMessage:)` method.
 
-* Currently, only mso_mdoc and sd_jwt formats are supported
+* Currently, mso_mdoc, sd_jwt and ldp_vc (W3C JSON-LD with Data Integrity proofs) formats are supported for issuance. An `ldp_vc` credential is issued without holder binding and is stored without issuer signature verification; presenting it is not supported yet.
 
 The method returns an ``IssuerResponse`` containing the issued documents together with the issuer registration policy and any warnings produced when registration certificate validation is enabled (see <doc:RegistrationCertificate>).
 

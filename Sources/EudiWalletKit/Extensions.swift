@@ -153,6 +153,7 @@ extension WalletStorage.Document {
 	public var docTypeIdentifier: DocTypeIdentifier? {
 		if docDataFormat == .cbor  { return .msoMdoc(docType: docType) }
 		else if docDataFormat == .sdjwt { return .sdJwt(vct: docType) }
+		else if docDataFormat == .ldpVc { return DocMetadata(from: metadata).map { .identifier($0.configurationIdentifier) } } // ldp_vc has no docType or vct, only the configuration identifier
 		else { return nil }
 	}
 }

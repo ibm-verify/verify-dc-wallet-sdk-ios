@@ -73,7 +73,10 @@ struct CredentialConfiguration: Codable, Sendable {
 		self.format = format
 		self.defaultCredentialOptions = defaultCredentialOptions
 	}
- }
+
+	/// ldp_vc credentials are issued without holder binding: the OpenID4VCI library sends no proofs for this format, so no keys are created
+	var requiresHolderBinding: Bool { format != .ldpVc }
+}
 
 struct DeferredIssuanceModel: Codable, Sendable {
 	let deferredCredentialEndpoint: CredentialIssuerEndpoint

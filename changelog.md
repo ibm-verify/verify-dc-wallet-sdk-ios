@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Add issuance of `ldp_vc` (W3C JSON-LD, Data Integrity) credentials through the new `DocDataFormat.ldpVc`. They are issued without holder binding (no proofs or keys), stored as JSON and shown with their `credentialSubject` claims; `validFrom`/`issuanceDate` and `validUntil`/`expirationDate` are exposed as the document validity dates. The issuer signature is not verified and presenting an `ldp_vc` is not supported.
+
 - Add `TrustConfiguration.readerTrustPolicy` for OpenID4VP reader access certificates, defaulting to `.enforce`. With `.warning`, valid signed requests may proceed with an untrusted certificate chain; signature verification and certificate-chain parsing remain required.
 
 - Add `ReaderAuthenticationStatus.authenticatedWithUntrustedCertificate` to distinguish policy-accepted requests from trusted reader authentication. Update exhaustive switches over this enum and use `PresentationSession.readerAuthenticationStatus` instead of the deprecated `readerCertIssuerValid`

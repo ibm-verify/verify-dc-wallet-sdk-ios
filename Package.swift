@@ -14,8 +14,15 @@ let package = Package(
 		.package(url: "https://github.com/eu-digital-identity-wallet/eudi-lib-ios-iso18013-data-transfer.git", exact: "0.28.0"),
 		.package(url: "https://github.com/eu-digital-identity-wallet/eudi-lib-ios-wallet-storage.git", exact: "0.26.2"),
 		.package(url: "https://github.com/eu-digital-identity-wallet/eudi-lib-sdjwt-swift.git", exact: "0.14.7"),
-		.package(url: "https://github.com/eu-digital-identity-wallet/eudi-lib-ios-openid4vp-swift.git", exact: "0.43.2"),
-		.package(url: "https://github.com/eu-digital-identity-wallet/eudi-lib-ios-openid4vci-swift.git", exact: "0.55.5"),
+		// Forked
+		.package(url: "https://github.com/trumanbutter/eudi-lib-ios-openid4vci-swift.git", exact: "0.55.5-tb.1"),
+		.package(url: "https://github.com/trumanbutter/eudi-lib-ios-openid4vp-swift.git", exact: "0.43.2-tb.1"),
+		.package(url: "https://github.com/trumanbutter/eudi-lib-ios-iso18013-data-model.git", exact: "0.27.3"),
+		// IBM: local fork of eudi-lib-ios-iso18013-data-model v0.27.2 adding DocDataFormat.ldpVc (branch ibm/ldp-vc-format).
+		// TEMPORARY: replace with a hosted url/branch pin once the fork is published.
+		// .package(path: "../eudi-lib-ios-iso18013-data-model"),
+		// .package(path: "../eudi-lib-ios-openid4vp-swift"),
+		// .package(path: "../eudi-lib-ios-openid4vci-swift"),
 		.package(url: "https://github.com/eu-digital-identity-wallet/eudi-lib-ios-statium-swift.git", exact: "0.6.0"),
 		.package(url: "https://github.com/apple/swift-docc-plugin", from: "1.5.0"),
 	],

@@ -166,35 +166,6 @@ extension MdocDataModel18013.CoseKey {
 	}
 }
 
-extension MdocDataModel18013.SignUpResponse {
-	/// Decompose CBOR signup responses from data
-	///
-	/// A data file may contain signup responses with many documents (doc.types).
-	/// - Parameter data: Data from file or memory
-	/// - Returns:  separate json serialized signup response objects for each doc.type
-	public static func decomposeCBORSignupResponse(data: Data) -> [(docType: String, jsonData: Data, drData: Data, issData: Data, pkData: Data)]? {
-		guard let sr = data.decodeJSON(type: MdocDataModel18013.SignUpResponse.self), let drs = decomposeCBORDeviceResponse(data: data) else { return nil }
-		return drs.compactMap { sr0 -> (docType: String, jsonData: Data, drData: Data, issData: Data, pkData: Data)? in
-			let drData = Data(CBOR.encode(sr0.dr.toCBOR(options: CBOROptions())))
-			let issData = Data(CBOR.encode(sr0.iss.toCBOR(options: CBOROptions())))
-			var jsonObj = ["response": drData.base64EncodedString()]
-			guard let jsonData = try? JSONSerialization.data(withJSONObject: jsonObj), let pk = sr.privateKey, let pkData = Data(base64Encoded: pk) else { return nil }
-			jsonObj["privateKey"] = pk
-			return (docType: sr0.docType, jsonData: jsonData, drData: drData, issData: issData, pkData: pkData)
-		}
-	}
-
-	/*
-	/// Device private key decoded from base64-encoded string
-	public var devicePrivateKey: CoseKeyPrivate? {
-		get async {
-			guard let privateKey else { return nil }
-			return await CoseKeyPrivate.from(base64: privateKey)
-		}
-	}
-	 */
-}
-
 extension Claim {
 	var metadata: DocClaimMetadata { DocClaimMetadata(display: display?.map(\.displayMetadata), isMandatory: mandatory, claimPath: path.value.map(\.description), valueType: valueType) }
 }
@@ -316,7 +287,7 @@ extension JSON {
 		case .number:
 			if name == "sex", let isex = Int(stringValue), isex >= 0, isex <= 2 {
 				let locSexValue = NSLocalizedString(isex == 1 ? "male" : "female", comment: "")
-				return (.string(locSexValue), locSexValue)
+				return (.integer(UInt64(intValue)), locSexValue)
 			}
 			if name == JWTClaimNames.issuedAt || name == JWTClaimNames.expirationTime {
 				let date = Date(timeIntervalSince1970: TimeInterval(intValue))
@@ -327,10 +298,6 @@ extension JSON {
 		case .string:
 			if isBase64ByteClaim(name: name, value: stringValue, valueType: valueType), let d = decodeBase64ByteClaim(stringValue) {
 				return (.bytes(d.bytes), "\(d.count) bytes")
-			}
-			if name == "sex", let isex = Int(stringValue), isex >= 0, isex <= 2 {
-				let locSexValue = NSLocalizedString(isex == 1 ? "male" : "female", comment: "")
-				return (.string(locSexValue), locSexValue)
 			}
 			return (.string(stringValue), stringValue)
 		case .bool: return (.boolean(boolValue), boolValue ? "Y" : "N")
@@ -541,8 +508,9 @@ extension DocClaimsModelConfiguration {
 extension MdocDataModel18013.CoseKey {
 	var jwk: JSONWebKey.JWK {
 		get throws {
-			guard let curve = JSONWebKey.JWK.CryptographicCurve(rawValue: crv.jwkName) else {
-			throw WalletError(description: "Unsupported CoseKey curve for JWK conversion: \(crv.jwkName)", code: .unsupportedAlgorithm)
+			let curveName = try crv.jwkName
+			guard let curve = JSONWebKey.JWK.CryptographicCurve(rawValue: curveName) else {
+			throw WalletError(description: "Unsupported CoseKey curve for JWK conversion: \(curveName)", code: .unsupportedAlgorithm)
 			}
 			return JSONWebKey.JWK(keyType: .ellipticCurve, curve: curve, x: Data(x), y: Data(y))
 		}
@@ -719,8 +687,16 @@ extension RegistrationCertificatePolicy {
 	  RegistrationCertificatePolicy(
 		validatePolicy: { wrpac, wrprc, dcql in
 			return await validator.validateCertificate(wrpac: wrpac, wrprc: wrprc, dcql: dcql)
+		},
+		missingCertificate: {
+			return await validator.missingCertificate()
 		}
 	  )
 	}
 
+}
+
+/// Use the algorithms advertised for the proof that will be sent.
+func resolveProofSigningAlgorithms(proofTypesSupported: [String: ProofTypeSupportedMeta], useAttestation: Bool) -> [String] {
+	proofTypesSupported[useAttestation ? "attestation" : "jwt"]?.algorithms ?? []
 }

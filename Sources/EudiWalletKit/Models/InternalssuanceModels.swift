@@ -28,6 +28,9 @@ struct CredentialConfiguration: Codable, Sendable {
     let scope: String?
 	let supportsAttestationProofType: Bool
 	let supportsJwtProofTypeWithAttestation: Bool
+	let supportsPlainJwtProof: Bool
+	/// Kept separately for same-key JWT fallback; absent in older persisted configurations.
+	let jwtProofSigningAlgValuesSupported: [String]?
     let credentialSigningAlgValuesSupported: [String]
 	let dpopSigningAlgValuesSupported: [String]?
 	let clientAttestationPopSigningAlgValuesSupported: [String]?
@@ -46,7 +49,9 @@ struct CredentialConfiguration: Codable, Sendable {
 		scope: String? = nil,
 		supportsAttestationProofType: Bool,
 		supportsJwtProofTypeWithAttestation: Bool,
+		supportsPlainJwtProof: Bool,
 		credentialSigningAlgValuesSupported: [String],
+		jwtProofSigningAlgValuesSupported: [String]? = nil,
 		dpopSigningAlgValuesSupported: [String]?,
 		clientAttestationPopSigningAlgValuesSupported: [String]?,
 		issuerDisplay: [DisplayMetadata],
@@ -63,6 +68,8 @@ struct CredentialConfiguration: Codable, Sendable {
 		self.scope = scope
 		self.supportsAttestationProofType = supportsAttestationProofType
 		self.supportsJwtProofTypeWithAttestation = supportsJwtProofTypeWithAttestation
+		self.supportsPlainJwtProof = supportsPlainJwtProof
+		self.jwtProofSigningAlgValuesSupported = jwtProofSigningAlgValuesSupported
 		self.credentialSigningAlgValuesSupported = credentialSigningAlgValuesSupported
 		self.dpopSigningAlgValuesSupported = dpopSigningAlgValuesSupported
 		self.clientAttestationPopSigningAlgValuesSupported = clientAttestationPopSigningAlgValuesSupported
@@ -81,6 +88,19 @@ struct DeferredIssuanceModel: Codable, Sendable {
 	let publicKeys: [Data]
 	let derKeyData: Data?
 	let timeStamp: TimeInterval
+	/// Seconds the issuer asks the wallet to wait before the next deferred credential request.
+	let interval: TimeInterval?
+	/// The key that signs the DPoP proofs of the transaction. If nil, the per-issuer DPoP key signs them.
+	let dpopKeyId: String?
+}
+
+public extension WalletStorage.Document {
+	/// Seconds the issuer asks the wallet to wait before the next deferred credential request.
+	/// Nil when the document is not deferred or the issuer sent no interval.
+	var deferredIssuanceInterval: TimeInterval? {
+		guard status == .deferred else { return nil }
+		return (try? JSONDecoder().decode(DeferredIssuanceModel.self, from: data))?.interval
+	}
 }
 
 struct PendingIssuanceModel: Codable {

@@ -26,12 +26,10 @@ struct OpenId4VpAuthenticationTests {
                     anchors: [fixture.der], registration: registration)
                 // Simulate dependency success without the wallet's trust evaluation.
                 service.chainVerifier = { _ in true }
-                await assertRejected(service, network: network)
+				await assertRejected(service, network: network, reportedError: "invalid_client")
                 #expect(service.readerAuthenticationStatus == .failed)
                 #expect(service.readerCertificateValidationMessage != nil)
-                // IBM patch: WRPRC extraction is skipped under `wrprcVpTrustPolicy == .warning`, so no
-                // registration warnings are produced (upstream expects a non-empty collection here).
-                if registration == .warning { #expect(service.wrpVerifierWarnings?.isEmpty ?? true) }
+                if registration == .warning { #expect(service.wrpVerifierWarnings?.isEmpty == false) }
             }
         }
     }
@@ -89,7 +87,7 @@ struct OpenId4VpAuthenticationTests {
             }
             // A dependency reporting success without invoking wallet validation must still be rejected.
             service.chainVerifier = { _ in true }
-            await assertRejected(service, network: network)
+			await assertRejected(service, network: network, reportedError: "invalid_client")
         }
     }
 
@@ -103,7 +101,7 @@ struct OpenId4VpAuthenticationTests {
                 readerTrustPolicy: .warning)
             let validate = service.chainVerifier
             service.chainVerifier = { _ in await validate([other.der.base64EncodedString()]) }
-            await assertRejected(service, network: network)
+			await assertRejected(service, network: network, reportedError: "invalid_client")
         }
     }
 
@@ -126,7 +124,6 @@ struct OpenId4VpAuthenticationTests {
         let requests = try await service.receiveRequest()
         let session = try makeSession(service)
         try session.decodeRequest(requests)
-        #expect(session.readerCertIssuerValid == true)
         #expect(session.readerAuthenticationStatus == .authenticated)
         #expect(!session.disclosedDocumentSets.isEmpty)
 
@@ -157,7 +154,6 @@ struct OpenId4VpAuthenticationTests {
         requests[0].readerAuthResults = ["": ReaderAuthenticationResult(isValidated: false,
             validationMessage: "Reader authentication was not evaluated", legalName: "Unverified name")]
         try session.decodeRequest(requests)
-        #expect(session.readerCertIssuerValid == false)
         #expect(session.readerCertValidationMessage == "Reader authentication was not evaluated")
         #expect(session.readerAuthenticationStatus == .notEvaluated)
         #expect(session.readerLegalName == nil)
@@ -165,7 +161,6 @@ struct OpenId4VpAuthenticationTests {
         requests[0].readerAuthResults = [:]
         try session.decodeRequest(requests)
         #expect(session.readerAuthenticationStatus == .notEvaluated)
-        #expect(session.readerCertIssuerValid == nil)
         #expect(session.readerCertValidationMessage == nil)
     }
 
@@ -179,11 +174,8 @@ struct OpenId4VpAuthenticationTests {
         let session = try makeSession(service)
         try session.decodeRequest(requests)
         #expect(session.readerAuthenticationStatus == .authenticated)
-        #expect(session.readerCertIssuerValid == true)
         #expect(session.readerLegalName != nil)
-        // IBM patch: WRPRC extraction is skipped under `wrprcVpTrustPolicy == .warning`, so no
-        // registration warnings are produced (upstream expects a non-empty collection here).
-        #expect(session.wrpVerifierWarnings?.isEmpty ?? true)
+        #expect(session.wrpVerifierWarnings?.isEmpty == false)
         await #expect(throws: PostError.self) {
             try await session.sendResponse(userAccepted: false, itemsToSend: [:])
         }
@@ -212,11 +204,12 @@ struct OpenId4VpAuthenticationTests {
         let session = try makeSession(service)
         session.presentationService = FaultPresentationService(msg: "Test service")
         let invalid = ReaderAuthenticationResult(isValidated: false, validationMessage: "Invalid signature", authBytes: Data([0]))
-        var results = ["first-document": invalid, "second-document": invalid]
-        // Keep the first/default entry valid: the other document must still affect the verdict.
-        results[try #require(results.keys.first)] = ReaderAuthenticationResult(isValidated: true, legalName: "Verified name")
-        requests[0].readerAuthResults = results
-        #expect(requests[0].defaultReaderAuthResult?.isValidated == true)
+        requests[0].readerAuthResults = [
+            "first-document": ReaderAuthenticationResult(isValidated: true, legalName: "Verified name"),
+            "second-document": invalid
+        ]
+        // A valid document cannot supply a shared reader identity when another fails authentication.
+        #expect(requests[0].defaultReaderAuthResult == nil)
         try session.decodeRequest(requests)
         #expect(session.readerAuthenticationStatus == .failed)
         #expect(session.readerLegalName == nil)
@@ -472,6 +465,41 @@ struct OpenId4VpAuthenticationTests {
         }
     }
 
+	@Test("Signed requests report an unsatisfiable query to the verifier", arguments: [false, true])
+	func reportsUnsatisfiableQueryForSignedRequest(byReference: Bool) async throws {
+		let fixture = try CertificateFixture()
+		for clientId in fixture.clientIds {
+			let token = try fixture.token(clientId: clientId, validSignature: true,
+										  requestedDocType: "org.example.unknown")
+			let (service, network) = try await makeService(clientId: clientId, token: token,
+														   byReference: byReference, anchors: [fixture.der])
+			await assertRejected(service, network: network, reportedError: "access_denied")
+			#expect(service.readerAuthenticationStatus == .failed)
+			#expect(service.readerAuthValidated)
+		}
+	}
+
+	@Test("Preregistered requests report an unsatisfiable query to the verifier", arguments: [false, true])
+	func reportsUnsatisfiableQueryForPreregisteredRequest(byReference: Bool) async throws {
+		let fixture = try CertificateFixture()
+		let client = try fixture.preregistered(clientId: "registered-verifier")
+		let token = try fixture.token(
+			clientId: client.clientId,
+			validSignature: true,
+			requestedDocType: "org.example.unknown"
+		)
+		let (service, network) = try await makeService(
+			clientId: client.clientId,
+			token: token,
+			byReference: byReference,
+			clientIdSchemes: [.preregistered([client])]
+		)
+
+		await assertRejected(service, network: network, reportedError: "access_denied")
+		#expect(service.readerAuthenticationStatus == .failed)
+		#expect(!service.readerAuthValidated)
+	}
+
     @Test("Authenticated X.509 requests reach consent with the expected client ID", arguments: [false, true])
     func acceptsSignedRequest(byReference: Bool) async throws {
         let fixture = try CertificateFixture()
@@ -507,7 +535,70 @@ struct OpenId4VpAuthenticationTests {
         #expect(await network.posts == 1)
     }
 
-    private func assertRejected(_ service: OpenId4VpService, network: RequestNetworking) async {
+	@Test(
+		"Preferred response modes preserve consent and require encryption metadata",
+		arguments: [false, true], [false, true]
+	)
+	func validatesPreferredResponseMode(userAccepted: Bool, encrypted: Bool) async throws {
+		let (service, network) = try await makeService(clientId: "redirect_uri:\(Self.responseURI)", token: nil)
+		_ = try await service.receiveRequest()
+		let resolved = try #require(service.resolvedRequestData)
+
+		#expect(resolved.request.state == nil)
+		#expect(resolved.request.responseEncryptionSpecification == nil)
+
+		service.openID4VpConfig = .init(preferredResponseMode: encrypted ? .directPostJWT : .directPost)
+
+		let queryId = try QueryId(value: "mdl")
+		let consent: ClientConsent = userAccepted
+		? .vpToken(
+			vpContent: .dcql(
+				verifiablePresentations: [
+					queryId: [.generic("presentation")]
+				]
+			)
+		)
+		: .negative(message: "access_denied")
+
+		if encrypted {
+			#expect(throws: WalletError.self) {
+				do {
+					_ = try service.buildAuthorizationResponse(resolved: resolved, consent: consent)
+				} catch let error as WalletError {
+					#expect(error.code == .responseEncryptionMissing)
+					throw error
+				}
+			}
+		} else {
+			let response = try service.buildAuthorizationResponse(resolved: resolved, consent: consent)
+			guard case let .directPost(url, payload) = response else {
+				Issue.record("Expected a direct POST response")
+				return
+			}
+
+			#expect(url.absoluteString == Self.responseURI)
+
+			let data = try JSONEncoder().encode(payload)
+			let fields = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+			#expect(fields["state"] as? String == "")
+
+			if userAccepted {
+				let presentations = try #require(fields["vp_token"] as? [String: [String]])
+				#expect(presentations == ["mdl": ["presentation"]])
+				#expect(fields["error"] == nil)
+			} else {
+				#expect(fields["error"] as? String == "access_denied")
+				#expect(fields["vp_token"] == nil)
+			}
+		}
+		#expect(await network.posts == 0)
+	}
+
+	private func assertRejected(
+		_ service: OpenId4VpService,
+		network: RequestNetworking,
+		reportedError: String? = nil
+	) async {
         await #expect(throws: WalletError.self) { try await service.receiveRequest() }
         #expect(service.resolvedRequestData == nil)
         #expect(service.dcql == nil)
@@ -518,7 +609,9 @@ struct OpenId4VpAuthenticationTests {
                     authenticationContext: ThreadSafeAuthContext(), onSuccess: nil)
             }
         }
-        #expect(await network.posts == 0)
+		#expect(await network.posts == (reportedError == nil ? 0 : 1))
+		if let reportedError { #expect(await network.postBodies.last?.contains("error=\(reportedError)") == true) }
+		#expect(await network.postBodies.allSatisfy { !$0.contains("vp_token=") })
         #expect(service.presentedDocumentIds.isEmpty)
     }
 
@@ -575,13 +668,32 @@ struct OpenId4VpAuthenticationTests {
         }
         init() throws {
             let name = try DistinguishedName { CommonName("verifier.example"); OrganizationName("Test Verifier") }
+            let publicKey = Certificate.PublicKey(key.publicKey)
+            let keyIdentifier = Array(Insecure.SHA1.hash(data: publicKey.subjectPublicKeyInfoBytes))[...]
+            // DistributionPoint -> distributionPoint -> fullName -> URI.
+            let crlURI = Array("https://example.invalid/reader.crl".utf8)
+            let crlDistributionPoints: [UInt8] = [
+                0x30, UInt8(crlURI.count + 8), 0x30, UInt8(crlURI.count + 6),
+                0xa0, UInt8(crlURI.count + 4), 0xa0, UInt8(crlURI.count + 2),
+                0x86, UInt8(crlURI.count)
+            ] + crlURI
+            let alternativeNames = SubjectAlternativeNames([.dnsName("verifier.example")])
+            let encodedAlternativeNames = try Certificate.Extension(alternativeNames, critical: false)
             let certificate = try Certificate(version: .v3, serialNumber: .init(bytes: [1]), publicKey: .init(key.publicKey),
                 notValidBefore: Date().addingTimeInterval(-3600), notValidAfter: Date().addingTimeInterval(86400),
                 issuer: name, subject: name, signatureAlgorithm: .ecdsaWithSHA256,
                 extensions: Certificate.Extensions {
                     Critical(BasicConstraints.isCertificateAuthority(maxPathLength: nil))
                     KeyUsage(digitalSignature: true, keyCertSign: true)
-                    SubjectAlternativeNames([.dnsName("verifier.example")])
+                    AuthorityKeyIdentifier(keyIdentifier: keyIdentifier)
+                    SubjectKeyIdentifier(keyIdentifier: keyIdentifier)
+                    try ExtendedKeyUsage([.init(oid: [1, 0, 18013, 5, 1, 6])])
+                    Certificate.Extension(oid: [2, 5, 29, 31], critical: false,
+                        value: crlDistributionPoints[...])
+                    alternativeNames
+                    // This self-signed fixture is also the root, so its issuer names match its subject names.
+                    Certificate.Extension(oid: [2, 5, 29, 18], critical: false,
+                        value: encodedAlternativeNames.value)
                 }, issuerPrivateKey: .init(key))
             var serializer = DER.Serializer()
             try serializer.serialize(certificate)
@@ -612,6 +724,7 @@ struct OpenId4VpAuthenticationTests {
     private actor RequestNetworking: Networking {
         var token: String
         var posts = 0
+		var postBodies: [String] = []
         var fetches = 0
         private var holdFetch = false
         private var heldFetch: CheckedContinuation<Void, Never>?
@@ -637,7 +750,11 @@ struct OpenId4VpAuthenticationTests {
             return (Data(token.utf8), HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/oauth-authz-req+jwt"])!)
         }
         func data(for request: URLRequest) async throws -> (Data, URLResponse) {
-            if request.httpMethod == "POST" { posts += 1; throw URLError(.unsupportedURL) }
+			if request.httpMethod == "POST" {
+				posts += 1
+				postBodies.append(String(decoding: request.httpBody ?? Data(), as: UTF8.self))
+				throw URLError(.unsupportedURL)
+			}
             return try await data(from: #require(request.url))
         }
     }

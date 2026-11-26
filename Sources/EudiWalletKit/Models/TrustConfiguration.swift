@@ -20,6 +20,8 @@ import OpenID4VCI
 
 /// Configuration that describes where trust anchors come from and how trust failures are handled.
 public struct TrustConfiguration: Sendable {
+	// Verified cache entries must not cross trust configurations, even for the same URL.
+	let statusCacheScope = UUID()
 	/// The policy applied to doc types without a specific entry in `docTypePolicies`.
 	public let defaultPolicy: TrustPolicy
 	/// Per doc-type overrides of `defaultPolicy`, keyed by doc type.
@@ -29,9 +31,10 @@ public struct TrustConfiguration: Sendable {
 	/// The trust policy applied to document status token validation.
 	/// Defaults to `.enforce`. Set to `.warning` to allow status checks to succeed even when the status token trust chain cannot be validated.
 	public let statusTrustPolicy: TrustPolicy
-	/// Trust policy for OpenID4VP reader access certificates, independent of issuer and registration policies.
-	/// Defaults to `.enforce`. With `.warning`, valid signed requests may proceed with an untrusted
-	/// certificate chain and report `ReaderAuthenticationStatus.authenticatedWithUntrustedCertificate`.
+	/// Trust policy for reader authentication, independent of issuer and registration policies.
+	/// Defaults to `.enforce`. With `.warning`, OpenID4VP valid signed requests may proceed with an
+	/// untrusted certificate chain and report `ReaderAuthenticationStatus.authenticatedWithUntrustedCertificate`.
+	/// BLE reports reader authentication results without enforcing them under `.warning`.
 	public let readerTrustPolicy: TrustPolicy
 	/// The trust policy applied to WRPRC validation during OpenID4VP and BLE presentation.
 	/// Defaults to `.enforce`. Set to `.warning` to allow presentation to proceed even when the WRPRC trust chain cannot be validated.
@@ -54,6 +57,12 @@ public struct TrustConfiguration: Sendable {
 	let accessTrustManager: EtsiTrustManager
 	/// Trust manager for reader/relying-party registration certificates. Uses the WRPRC verification context.
 	let registrationTrustManager: EtsiTrustManager
+	private let statusTrustManagers: StatusTrustManagerCache
+
+	/// Reuses a fixed-context validator for the lifetime of this configuration and its copies.
+	func statusTrustManager(for owner: StatusListOwner?) -> StatusTrustManager {
+		statusTrustManagers.manager(for: owner)
+	}
 
 	public init(
 		trustSource: TrustSource,
@@ -75,6 +84,7 @@ public struct TrustConfiguration: Sendable {
 		self.wrprcVpTrustPolicy = wrprcVpTrustPolicy
 		self.wrprcVciTrustPolicy = wrprcVciTrustPolicy
 		self.clockSkew = clockSkew
+		statusTrustManagers = StatusTrustManagerCache(source: trustSource, fallback: fallbackTrustSource)
 		let issuerSource = trustSource.contextTypeMappings == nil ? trustSource.withContextTypeMappings(.default) : trustSource
 		let fallbackTrustManager: EtsiTrustManager?
 		if let fts = fallbackTrustSource {
@@ -104,6 +114,11 @@ public struct TrustConfiguration: Sendable {
 	var issuerTrustManager: SecTrustSource
 	/// Trust manager for reader/relying-party access certificates backed by platform `SecTrust`.
 	let accessTrustManager: SecTrustSource
+	/// Status signers use the configured anchors without the mdoc reader certificate profile.
+	func statusTrustManager(for owner: StatusListOwner?) -> SecTrustSource {
+		SecTrustSource(rootIaca: accessTrustManager.rootIaca, usage: .mdocAuth,
+			revocationPolicy: accessTrustManager.revocationPolicy)
+	}
 
 	public init(
 		rootIaca: [[Data]],

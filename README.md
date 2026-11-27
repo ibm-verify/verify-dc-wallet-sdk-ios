@@ -1,4 +1,4 @@
-# IBM Verify DC Wallet SDK for iOS
+# IBM Verify Digital Credentials Wallet SDK for iOS
 
 IBM's distribution of the [EUDI Wallet Kit library for iOS](https://github.com/eu-digital-identity-wallet/eudi-lib-ios-wallet-kit).
 

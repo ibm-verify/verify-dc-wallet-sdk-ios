@@ -26,45 +26,89 @@ import struct MdocDataModel18013.StatusList
 
 public actor DocumentStatusService {
 	let statusList: StatusList
-	/// Trust configuration used to validate the reader/relying-party access certificate chain.
+	let owner: StatusListOwner?
+	/// Trust configuration used to validate the status-list token certificate chain.
 	public let trustConfig: TrustConfiguration
 	let dateProvider: @Sendable () -> Date
+	/// Reuses verified tokens until their `ttl` or `exp` ends. Nil fetches the token on each check.
+	let cache: StatusListTokenCache?
 	private static let logger = Logger(label: "DocumentStatusService")
 
 	/// Supplies a fresh validation time for each status check by default.
-	public init(statusList: StatusList, dateProvider: @escaping @Sendable () -> Date = { Date() }, trustConfig: TrustConfiguration) {
+	/// Provide `owner` to select the ETSI status-signing context. Missing or unmapped owners
+	/// cannot establish ETSI trust and fail when `statusTrustPolicy` is `.enforce`.
+	public init(statusList: StatusList, dateProvider: @escaping @Sendable () -> Date = { Date() }, trustConfig: TrustConfiguration, cache: StatusListTokenCache? = nil, owner: StatusListOwner? = nil) {
 		self.statusList = statusList
+		self.owner = owner
 		self.trustConfig = trustConfig
 		self.dateProvider = dateProvider
+		self.cache = cache
 	}
 
 	/// Uses a fixed validation time, for callers that explicitly supply a date.
-	public init(statusList: StatusList, date: Date, trustConfig: TrustConfiguration) {
-		self.init(statusList: statusList, dateProvider: { date }, trustConfig: trustConfig)
+	public init(statusList: StatusList, date: Date, trustConfig: TrustConfiguration, owner: StatusListOwner? = nil) {
+		self.init(statusList: statusList, dateProvider: { date }, trustConfig: trustConfig, owner: owner)
 	}
 
 	public func getStatus() async throws -> CredentialStatus {
+		try await getStatus(networkingService: NetworkingService())
+	}
+
+	func getStatus(networkingService: any NetworkingServiceType) async throws -> CredentialStatus {
 		guard let statusReference: StatusReference = .init(idx: statusList.idx, uriString: statusList.uri) else {
 			throw WalletError(description: "Invalid status identifier", code: .invalidStatusToken)
 		}
 		let getStatus = GetStatus()
+		let verifier = StatusListTokenSignatureVerifier(trustConfig: trustConfig, owner: owner)
 		let tokenFetcher = StatusListTokenFetcher(
-			verifier: StatusListTokenSignatureVerifier(trustConfig: trustConfig),
+			networkingService: networkingService,
+			verifier: verifier,
 			dateProvider: dateProvider
 		)
-		let result = await getStatus.getStatus(index: statusReference.idx, url: statusReference.uri, fetchClaims: tokenFetcher.getStatusClaims, clockSkew: trustConfig.clockSkew)
+		let statusOwner = owner
+		let trustScope = trustConfig.statusCacheScope
+		let fetchClaims: FetchClaimsHandler = if let cache {
+			{ format, url, clockSkew in await cache.claims(format: format, url: url, clockSkew: clockSkew, owner: statusOwner, trustScope: trustScope, fetch: tokenFetcher.getStatusClaims) }
+		} else {
+			tokenFetcher.getStatusClaims
+		}
+		let result = await getStatus.getStatus(index: statusReference.idx, url: statusReference.uri, fetchClaims: fetchClaims, clockSkew: trustConfig.clockSkew)
 		switch result {
 			case .success(let status): return status
-			case .failure(let error): throw WalletError(description: "Status check failed", code: .statusCheckFailed, innerError: error)
+			case .failure(let error):
+				// Statium converts verifier errors into strings. Recover the original failure
+				// from this check's verifier so authentication failures remain enforceable.
+				if let verificationError = await verifier.verificationError {
+					throw WalletError(description: "Status token verification failed", code: .trustError, innerError: verificationError)
+				}
+				throw WalletError(description: "Status check failed", code: .statusCheckFailed, innerError: error)
 		}
 	}
 }
 
-struct StatusListTokenSignatureVerifier: VerifyStatusListTokenSignature {
+actor StatusListTokenSignatureVerifier: VerifyStatusListTokenSignature {
+	let owner: StatusListOwner?
 	let trustConfig: TrustConfiguration
+	private(set) var verificationError: (any Error)?
+
+	init(trustConfig: TrustConfiguration, owner: StatusListOwner? = nil) {
+		self.owner = owner
+		self.trustConfig = trustConfig
+	}
+
 	private static let logger = Logger(label: "StatusListTokenSignatureVerifier")
 
 	func verify(statusListToken: Data, format: StatusListTokenFormat, at: Date) async throws {
+		verificationError = nil
+		do {
+			try await verifyToken(statusListToken: statusListToken, format: format, at: at)
+		} catch {
+			verificationError = error
+			throw error
+		}
+	}
+
+	private func verifyToken(statusListToken: Data, format: StatusListTokenFormat, at: Date) async throws {
 		let attTF: AttestToken.Format = switch format { case .jwt: .jwt; case .cwt: .cwt }
 		let att = try x5cVerifyJwtOrCwt.parse(attestData: statusListToken, format: attTF)
 		if case let .jwt(jws) = att {
@@ -81,7 +125,7 @@ struct StatusListTokenSignatureVerifier: VerifyStatusListTokenSignature {
 				throw WalletError(description: "Unsupported status JWT signature algorithm: \(algorithm.rawValue)", code: .unsupportedAlgorithm)
 			}
 		}
-		let (isValid, reason) = try await x5cVerifyJwtOrCwt.validateTrust(att, trustValidator: trustConfig.accessTrustManager)
+		let (isValid, reason) = try await x5cVerifyJwtOrCwt.validateTrust(att, trustValidator: trustConfig.statusTrustManager(for: owner))
 		guard isValid else {
 			let message = "\(format) status token trust error: \(reason ?? "")"
 			switch trustConfig.statusTrustPolicy {

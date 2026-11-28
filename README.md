@@ -12,15 +12,15 @@ fork once merged.
 ## Requirements
 
 - iOS 17.0+
-- Swift 6.2+
-- Xcode 26.0+
+- Swift 6.3.3+
+- Xcode with a Swift 6.3.3+ toolchain
 
 ---
 
 ## SPM Integration
 
 **Xcode project:** File → Add Package Dependencies → enter the URL below and set the version
-rule to `Up to Next Major Version` from `1.1.0`.
+rule to `Up to Next Major Version` from `2.0.0`.
 
 ```
 https://github.com/ibm-verify/verify-dc-wallet-sdk-ios.git
@@ -30,7 +30,7 @@ https://github.com/ibm-verify/verify-dc-wallet-sdk-ios.git
 
 ```swift
 // In Package.swift dependencies:
-.package(url: "https://github.com/ibm-verify/verify-dc-wallet-sdk-ios.git", from: "1.1.0")
+.package(url: "https://github.com/ibm-verify/verify-dc-wallet-sdk-ios.git", from: "2.0.0")
 
 // In your target dependencies:
 .product(name: "EudiWalletKit", package: "verify-dc-wallet-sdk-ios")
@@ -62,7 +62,8 @@ is validated and supported only against the IBM server products listed above.
 | IBM Fork Version | Upstream `eudi-lib-ios-wallet-kit` | Upstream SHA | IBM Patches | Date |
 |---|---|---|---|---|
 | `v1.0.0` | `v0.35.2` | `181a53cb` | [Fix log entries overwriting each other](#v100--fix-log-entries-overwriting-each-other) | 2026-08-19 |
-| `v1.1.0` | `v0.56.1` | `2df9cfba` | [Restore stateless VCI auto-config](#v110--restore-stateless-autoregisterviciconfiguration-when-registry-is-empty) · [Skip WRPRC extraction under .warning policy](#v110--skip-wrprc-extraction-when-wrprcvptrustpolicy-is-warning) · [CI workflow housekeeping](#v110--ci-workflow-housekeeping) | 2026-10-20 |
+| `v1.1.0` | `v0.56.1` | `2df9cfba` | [Restore stateless VCI auto-config](#v110--restore-stateless-autoregisterviciconfiguration-when-registry-is-empty) · Skip WRPRC extraction under .warning policy (since [dropped](#dropped-patches)) · [CI workflow housekeeping](#v110--ci-workflow-housekeeping) | 2026-10-20 |
+| `v2.0.0` | `v0.65.4` | `f67e0046` | [Restore stateless VCI auto-config](#v110--restore-stateless-autoregisterviciconfiguration-when-registry-is-empty) · [CI workflow housekeeping](#v110--ci-workflow-housekeeping) | 2026-11-25 |
 
 > **`v1.1.0` history:** `v1.1.0` was first cut against upstream `v0.54.8` (`54858f3f`) and
 > re-pointed at upstream `v0.56.1` on 2026-10-20. That change drops the
@@ -119,42 +120,14 @@ config = OpenId4VciConfiguration(credentialIssuerURL: urlString)
 
 ---
 
-### `v1.1.0` — Skip WRPRC extraction when `wrprcVpTrustPolicy` is `.warning`
-
-**Commit:** `4a6a57b0`  
-**File:** `Sources/EudiWalletKit/Services/OpenId4VpService.swift` (+5, −1)
-
-Upstream introduced WRPRC (Wallet Relying Party Registration Certificate) validation via
-`registrationCertificatePolicy` in `v0.38.0`, with `wrprcVpTrustPolicy` following in `v0.40.2`. When `wrprcVpTrustPolicy == .warning` and the verifier
-gateway does not include `verifier_info` in the JAR, the upstream `openid4vp-swift` library
-throws a hard `ValidationError` before the IBM trust-policy check can run, blocking all
-verification against gateways that do not send `verifier_info` (e.g. DMV gamma).
-
-The IBM patch gates `registrationCertificatePolicy` on
-`trustConfig.wrprcVpTrustPolicy == .enforce`, so WRPRC extraction is skipped entirely under
-`.warning`, as if the verifier did not use WRPRC.
-
-```swift
-// Upstream (WRPRC extraction always attempted when validateRegistrationCertificate is true):
-registrationCertificatePolicy: openID4VpConfig.validateRegistrationCertificate
-    ? .default(validator: wrpRegistrationValidator) : nil
-
-// IBM patch (skipped when wrprcVpTrustPolicy is .warning):
-registrationCertificatePolicy: openID4VpConfig.validateRegistrationCertificate
-    && trustConfig.wrprcVpTrustPolicy == .enforce
-    ? .default(validator: wrpRegistrationValidator) : nil
-```
-
----
-
 ### `v1.1.0` — CI workflow housekeeping
 
 **File:** `.github/workflows/swift.yml`
 
 The IBM fork's CI workflow differs from upstream: it runs `swift build` and `swift test` on
-`macos-latest`, whereas upstream runs `fastlane tests` on `macos-15`. It is left as-is during
-upstream syncs pending a review of PAT workflow scope for the IBM fork. No functional change to
-the SDK.
+`macos-latest`, whereas upstream runs `bundle exec fastlane tests` on `macos-latest`. It is
+left as-is during upstream syncs pending a review of PAT workflow scope for the IBM fork. No
+functional change to the SDK.
 
 ---
 
@@ -163,11 +136,21 @@ the SDK.
 | Patch | Dropped in | Reason |
 |---|---|---|
 | Honour `TrustConfiguration.defaultPolicy .warning` for x509 reader chains (`18595ff6`) | `v1.1.0` (re-point to `v0.56.1`) | Upstream added `TrustConfiguration.readerTrustPolicy` (default `.enforce`). With `.warning`, a validly signed request with an untrusted reader chain proceeds and reports `ReaderAuthenticationStatus.authenticatedWithUntrustedCertificate`. |
+| Skip WRPRC extraction when `wrprcVpTrustPolicy` is `.warning` (`4a6a57b0`) | `v0.65.4` sync (VDEV-324719) | `openid4vp-swift` 0.44.x no longer throws when `verifier_info` or the WRPRC is missing. It calls `RegistrationCertificatePolicy.missingCertificate`, which `WrpVpRegistrationValidator` implements: `.warning` grants with a `wrprcMissing` warning and `.enforce` rejects the request. |
 
 **Migration:** `defaultPolicy` no longer controls reader-chain trust. Apps that relied on
 `defaultPolicy: .warning` to accept untrusted reader chains must also set
 `readerTrustPolicy: .warning`. As with the old patch, this is a development convenience; use
 `.enforce` in production.
+
+**Migration (WRPRC):** under `wrprcVpTrustPolicy: .warning`, a request without a WRPRC now
+proceeds with a `wrprcMissing` entry in `wrpVerifierWarnings` instead of having WRPRC handling
+skipped (no warnings). Apps that treated empty warnings as "no WRPRC" should check for
+`.wrprcMissing`.
+
+**Migration (`readerCertIssuerValid`):** upstream removed the deprecated
+`PresentationSession.readerCertIssuerValid` property after `v0.56.1`. Apps still reading it must
+switch to `PresentationSession.readerAuthenticationStatus`.
 
 ---
 

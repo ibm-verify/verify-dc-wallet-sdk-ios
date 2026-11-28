@@ -70,12 +70,13 @@ class OpenId4VpUtils {
 		var zkSpecsRequested: [DocType: [ZkSystemSpec]]?
 		for credQuery in dcql.credentials {
 			let formatRequested: DocDataFormat = credQuery.dataFormat
-			guard let docType = credQuery.docTypeOrVct else { continue }
-			if !idsToDocTypes.values.contains(docType) {logger?.warning("Document type \(docType) not in supported document types \(idsToDocTypes.values)")}
-			inputDescriptorMap[docType] = credQuery.id.value; formatsRequested[docType] = formatRequested
-			if let zkSpecs = credQuery.zkSpecs {
-				if zkSpecsRequested == nil { zkSpecsRequested = [:] }
-				zkSpecsRequested![docType] = zkSpecs
+			for docType in credQuery.docTypesOrVcts {
+				if !idsToDocTypes.values.contains(docType) {logger?.warning("Document type \(docType) not in supported document types \(idsToDocTypes.values)")}
+				inputDescriptorMap[docType] = credQuery.id.value; formatsRequested[docType] = formatRequested
+				if let zkSpecs = credQuery.zkSpecs {
+					if zkSpecsRequested == nil { zkSpecsRequested = [:] }
+					zkSpecsRequested![docType] = zkSpecs
+				}
 			}
 		}
 		return (formatsRequested, inputDescriptorMap, zkSpecsRequested)
@@ -143,16 +144,18 @@ class OpenId4VpUtils {
 	static func makeCborClaimData(
 		from docsCbor: [Document.ID: IssuerSigned]?,
 		claimPaths: inout [Document.ID: [ClaimPath]],
-		claimValues: inout [Document.ID: [ClaimPath: [String]]]
+		claimValues: inout [Document.ID: [ClaimPath: [DCQLClaimValue]]]
 	) {
-		var paths = [ClaimPath](); var values = [ClaimPath: [String]]()
+		var paths = [ClaimPath](); var values = [ClaimPath: [DCQLClaimValue]]()
 		for (docId, issuerSigned) in docsCbor ?? [:] {
 			paths.removeAll(); values.removeAll()
 			guard let isNs = issuerSigned.issuerNameSpaces else { continue }
 			for (ns, items) in isNs.nameSpaces {
 				for item in items {
 					paths.append(ClaimPath([.claim(name: String(ns)), .claim(name: item.elementIdentifier)]))
-					values[paths.last!] = [item.description]
+					if let value = DcqlClaimValueConversion.fromCbor(item.elementValue) {
+						values[paths.last!] = [value]
+					}
 				}
 			}
 			claimPaths[docId] = paths
@@ -163,27 +166,32 @@ class OpenId4VpUtils {
 	static func makeSdJwtClaimData(
 		from docsSdJwt: [Document.ID: SignedSDJWT]?,
 		claimPaths: inout [Document.ID: [ClaimPath]],
-		claimValues: inout [Document.ID: [ClaimPath: [String]]]
+		claimValues: inout [Document.ID: [ClaimPath: [DCQLClaimValue]]]
 	) {
-		var paths = [ClaimPath](); var values = [ClaimPath: [String]]()
+		var paths = [ClaimPath](); var values = [ClaimPath: [DCQLClaimValue]]()
 
 		for (docId, sdjwt) in docsSdJwt ?? [:] {
-			guard let allPathsDict = (try? sdjwt.recreateClaims())?.disclosuresPerClaimPath else { continue }
+			guard let recreated = try? sdjwt.recreateClaims(),
+				  let allPathsDict = recreated.disclosuresPerClaimPath else { continue }
 			paths.removeAll(); values.removeAll()
-			for (p, disclosures) in allPathsDict {
-				let mappedElements = p.value.map { element in
-					if case .claim(let name) = element { return ClaimPathElement.claim(name: name) }
-					if case .arrayElement(let index) = element { return ClaimPathElement.arrayElement(index: index) }
+			for (p, _) in allPathsDict {
+				var node = recreated.recreatedClaims
+				let mappedElements = p.value.compactMap { element -> ClaimPathElement? in
+					if case .claim(let name) = element { node = node[name]; return ClaimPathElement.claim(name: name) }
+					// sd-jwt parses numeric object keys (e.g. age_equal_or_over/16) as array indices
+					if case .arrayElement(let index) = element, node.type == .dictionary {
+						let key = String(index)
+						guard let value = node.dictionary?[key] else { return nil }
+						node = value
+						return ClaimPathElement.claim(name: key)
+					}
+					if case .arrayElement(let index) = element { node = node[index]; return ClaimPathElement.arrayElement(index: index) }
 					return ClaimPathElement.allArrayElements
 				}
+				guard mappedElements.count == p.value.count else { continue }
 				let path = ClaimPath(mappedElements)
 				paths.append(path)
-				values[path] = disclosures.map { disclosure in
-					guard let data = Data(base64URLEncoded: disclosure),
-						  let json = try? JSONSerialization.jsonObject(with: data) as? [Any],
-						  json.count >= 3 else { return disclosure }
-					return if let strValue = json[2] as? String { strValue } else { "\(json[2])" }
-				}
+				values[path] = DcqlClaimValueConversion.fromJson(recreated.recreatedClaims, at: path)
 			}
 			claimPaths[docId] = paths
 			claimValues[docId] = values
@@ -252,12 +260,26 @@ extension ClaimPathElement {
 }
 
 extension CredentialQuery {
-	public var docTypeOrVct: String? {
+	/// The first requested type, retained for callers that need a single display value.
+	public var docTypeOrVct: String? { docTypesOrVcts.first }
+
+	/// All accepted document types or SD-JWT VC types for this query.
+	public var docTypesOrVcts: [String] {
 		let mdocTypeValue = meta.dictionaryObject?["doctype_value"]
 		let vctValues = meta.dictionaryObject?["vct_values"]
 		let metaDocType = mdocTypeValue ?? vctValues ?? meta.dictionaryObject?.first?.value
-		let docType = metaDocType as? String ?? (metaDocType as? [String])?.first
-		return docType
+		if let docType = metaDocType as? String { return [docType] }
+		return metaDocType as? [String] ?? []
+	}
+
+	/// Matches every accepted type while preserving each credential's actual type.
+	func matchingCredentials(queryable: any DcqlQueryable) -> [(id: Document.ID, docType: DocType)] {
+		var seen = Set<Document.ID>()
+		return docTypesOrVcts.flatMap { docType in
+			queryable.getCredentials(docOrVctType: docType, docDataFormat: dataFormat)
+				.filter { seen.insert($0).inserted }
+				.map { (id: $0, docType: docType) }
+		}
 	}
 
 	// https://developers.google.com/wallet/identity/verify/accepting-ids-from-wallet-online#zkp
@@ -273,7 +295,8 @@ extension CredentialQuery {
 }
 
 extension ClaimPath {
-	public func contains2(_ that: ClaimPath) -> Bool { zip(self.value, that.value).allSatisfy { (selfElement, thatElement) in selfElement.contains(thatElement) } }
+	/// True when `that` is this path or a path below it. A longer path never contains a shorter path.
+	public func contains2(_ that: ClaimPath) -> Bool { self.value.count <= that.value.count && zip(self.value, that.value).allSatisfy { (selfElement, thatElement) in selfElement.contains(thatElement) } }
 }
 
 extension DCQL {
@@ -339,14 +362,14 @@ extension OpenId4VpUtils {
 		// Step 1: Process individual credential queries
 		for credQuery in dcql.credentials {
 			guard let docType = credQuery.docTypeOrVct else { throw WalletError(description: "Credential query \(credQuery.id.value) does not have a doc type", code: .invalidQueryResolution) }
-			let format = credQuery.dataFormat
 			let isMultiple = credQuery.multiple == true
 			// Find matching credentials
-			let matchingCredIds = queryable.getCredentials(docOrVctType: docType, docDataFormat: format)
-			let docTypeDisplayName = docTypeDisplayNames[docType] ?? docType
-			if matchingCredIds.isEmpty, dcql.credentialSets == nil { throw WalletError(description: "Credential of type \(docTypeDisplayName) cannot be found.", code: .credentialNotFound, context: ["docType": docType]) }
+			let matchingCredentials = credQuery.matchingCredentials(queryable: queryable)
+			let docTypeDisplayName = credQuery.docTypesOrVcts.map { docTypeDisplayNames[$0] ?? $0 }.joined(separator: ", ")
+			if matchingCredentials.isEmpty, dcql.credentialSets == nil { throw WalletError(description: "Credential of type \(docTypeDisplayName) cannot be found.", code: .credentialNotFound, context: ["docType": docType]) }
 			// Try to find credentials that satisfy the claim requirements
-			for (credIndex, credId) in matchingCredIds.enumerated() {
+			for (credIndex, credential) in matchingCredentials.enumerated() {
+				let (credId, docType) = credential
 				do {
 					let optionId = !isMultiple ? "\(credQuery.id.value)-\(credIndex)" : credQuery.id.value
 					let claimPaths = try resolveClaimsForCredential(credQuery: credQuery, credId: credId, queryable: queryable)
@@ -404,9 +427,8 @@ extension OpenId4VpUtils {
 			if requiredSetsOptions.contains(where: \.isEmpty) {
 				throw WalletError(description: "Required credential_set cannot be satisfied", code: .credentialSetNotSatisfied)
 			}
-			// Cartesian product across all required sets
-			let requiredCombinations = requiredSetsOptions.reduce([(String, CredentialSelectionSet)]()) { acc, setOptions in
-				if acc.isEmpty { return setOptions }
+			// Seed with one empty combination so optional-only sets can expand.
+			let requiredCombinations = requiredSetsOptions.reduce([("", CredentialSelectionSet())]) { acc, setOptions in
 				return acc.flatMap { (existingKey, existingSet) in
 					setOptions.map { (optKey, optSet) in
 						let combinedKey = existingKey.isEmpty ? optKey : "\(existingKey)|\(optKey)"
@@ -430,7 +452,8 @@ extension OpenId4VpUtils {
 					}
 				}
 			}
-			for (key, set) in combinations {
+			// Presentation requires at least one credential; omit the skip-all variant.
+			for (key, set) in combinations where !set.isEmpty {
 				resultDict[key] = set
 			}
 		} else {
@@ -464,7 +487,7 @@ extension OpenId4VpUtils {
 		}
 		if resultDict.isEmpty {
 			let notFoundCred = dcql.credentials.first { c in credentialQueryResults[c.id]?.isEmpty != false }
-			if let notFoundCred {logger.warning("No credential found matching docType/vct: \(notFoundCred.docTypeOrVct ?? "") with format: \(notFoundCred.format)")}
+			if let notFoundCred {logger.warning("No credential found matching docType/vct: \(notFoundCred.docTypesOrVcts.joined(separator: ", ")) with format: \(notFoundCred.format)")}
 			throw lastError ?? WalletError(description: "DCQL query could not be satisfied", code: .dcqlQueryNotSatisfied)
 		}
 		return resultDict

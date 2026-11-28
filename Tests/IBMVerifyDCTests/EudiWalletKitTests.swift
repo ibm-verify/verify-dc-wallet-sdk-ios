@@ -340,40 +340,120 @@ struct EudiWalletKitTests {
 		}
 	}
 
-	@Test("Sex field displays male/female for both number and string JSON types")
-	func testSexFieldConversion() throws {
-		// When sex is a JSON number
-		let jsonNumber = JSON(parseJSON: "{ \"sex\": 1 }")
-		let claimMetadata: [DocClaimMetadata]? = nil
-		let uiCulture: String? = nil
-		let numberClaims = jsonNumber.toClaimsArray(pathPrefix: [], claimMetadata, uiCulture)?.0
-		let numberSex = numberClaims?.first(where: { $0.name == "sex" })
-		#expect(numberSex != nil)
-		#expect(numberSex?.stringValue == "male") // raw value preserved
-		if case .string(let display) = numberSex?.dataValue {
-			#expect(display == "male")
+	@Test("Sex field preserves raw values and formats only numeric display text", arguments: [0, 1, 2, 9])
+	func testSexFieldConversion(value: Int) throws {
+		let expectedDisplay = value <= 2
+			? NSLocalizedString(value == 1 ? "male" : "female", comment: "")
+			: String(value)
+		let numberClaims = JSON(["sex": value]).toClaimsArray(pathPrefix: [], nil, nil)?.0
+		let numberSex = try #require(numberClaims?.first { $0.name == "sex" })
+		#expect(numberSex.stringValue == expectedDisplay)
+		if case .integer(let rawValue) = numberSex.dataValue {
+			#expect(rawValue == UInt64(value))
 		} else {
-			Issue.record("Expected .string data value for sex number claim")
+			Issue.record("Expected .integer data value for sex number claim")
 		}
-		// When sex is a JSON string (Python issuer encodes as string)
-		let jsonString = JSON(parseJSON: "{ \"sex\": \"1\" }")
-		let stringClaims = jsonString.toClaimsArray(pathPrefix: [], claimMetadata, uiCulture)?.0
-		let stringSex = stringClaims?.first(where: { $0.name == "sex" })
-		#expect(stringSex != nil)
-		#expect(stringSex?.stringValue == "male")
-		if case .string(let display) = stringSex?.dataValue {
-			#expect(display == "male")
+
+		// String claims retain their original display text.
+		let stringClaims = JSON(["sex": String(value)]).toClaimsArray(pathPrefix: [], nil, nil)?.0
+		let stringSex = try #require(stringClaims?.first { $0.name == "sex" })
+		#expect(stringSex.stringValue == String(value))
+		if case .string(let rawValue) = stringSex.dataValue {
+			#expect(rawValue == String(value))
 		} else {
 			Issue.record("Expected .string data value for sex string claim")
 		}
-		// Female value
-		let jsonFemale = JSON(parseJSON: "{ \"sex\": \"2\" }")
-		let femaleClaims = jsonFemale.toClaimsArray(pathPrefix: [], claimMetadata, uiCulture)?.0
-		let femaleSex = femaleClaims?.first(where: { $0.name == "sex" })
-		if case .string(let display) = femaleSex?.dataValue {
-			#expect(display == "female")
-		} else {
-			Issue.record("Expected .string data value for female sex claim")
+	}
+
+	@Test("Issuer credential reuse policy controls batch and reissue defaults")
+	func testResolveCredentialOptionsFromReusePolicy() async throws {
+		let service = try makeVciService(storageService: TestDataStorageService())
+		let issuerBatch = try BatchCredentialIssuance(batchSize: 6)
+
+		let noPolicy = try await service.resolveCredentialOptions(batchCredentialIssuance: issuerBatch)
+		#expect(noPolicy.batchSize == 6)
+		#expect(noPolicy.reissueTriggerUnused == nil)
+		if case .rotateUse = noPolicy.credentialPolicy {} else { Issue.record("Expected rotation when no reuse policy is declared") }
+
+		let onceOnly = CredentialReusePolicy(id: "arf_annex_ii", options: [.onceOnly(batchSize: 4, reissueTriggerUnused: 2)])
+		let oneTimeOptions = try await service.resolveCredentialOptions(batchCredentialIssuance: issuerBatch, credentialReusePolicy: onceOnly)
+		#expect(oneTimeOptions.batchSize == 4)
+		#expect(oneTimeOptions.reissueTriggerUnused == 2)
+		#expect(oneTimeOptions.reissueTriggerLifetimeLeft == nil)
+		if case .oneTimeUse = oneTimeOptions.credentialPolicy {} else { Issue.record("once_only should use one-time credentials") }
+
+		let limitedTime = CredentialReusePolicy(id: "arf_annex_ii", options: [.limitedTime(reissueTriggerLifetimeLeft: 12)])
+		let limitedTimeOptions = try await service.resolveCredentialOptions(batchCredentialIssuance: issuerBatch, credentialReusePolicy: limitedTime)
+		#expect(limitedTimeOptions.batchSize == 1)
+		#expect(limitedTimeOptions.reissueTriggerUnused == nil)
+		#expect(limitedTimeOptions.reissueTriggerLifetimeLeft == 12)
+
+		let rotating = CredentialReusePolicy(id: "arf_annex_ii", options: [.rotatingBatch(batchSize: 3, reissueTriggerLifetimeLeft: 5)])
+		let requested = CredentialOptions(credentialPolicy: .oneTimeUse, batchSize: 10, reissueTriggerUnused: 9, reissueTriggerLifetimeLeft: 9)
+		let rotatingOptions = try await service.resolveCredentialOptions(batchCredentialIssuance: issuerBatch, credentialReusePolicy: rotating, userCredentialOptions: requested)
+		#expect(rotatingOptions.batchSize == 3)
+		#expect(rotatingOptions.reissueTriggerUnused == nil)
+		#expect(rotatingOptions.reissueTriggerLifetimeLeft == 5)
+		if case .rotateUse = rotatingOptions.credentialPolicy {} else { Issue.record("Issuer reuse policy should override the wallet's policy") }
+
+		let walletOptions = try await service.resolveCredentialOptions(batchCredentialIssuance: try BatchCredentialIssuance(batchSize: 2), userCredentialOptions: requested)
+		#expect(walletOptions.batchSize == 2)
+		#expect(walletOptions.reissueTriggerUnused == 9)
+
+		let unsupported = CredentialReusePolicy(id: "unknown-policy", options: [.onceOnly(batchSize: 2, reissueTriggerUnused: 1)])
+		do {
+			_ = try await service.resolveCredentialOptions(batchCredentialIssuance: issuerBatch, credentialReusePolicy: unsupported)
+			Issue.record("Unsupported reuse policy id should fail")
+		} catch CredentialReusePolicyError.unsupportedPolicyId(let id) {
+			#expect(id == "unknown-policy")
+		} catch {
+			Issue.record("Expected an unsupported reuse policy error, received \(error)")
+		}
+	}
+
+	@Test("Credential configuration resolution supports both formats and rejects unknown identifiers")
+	func testGetCredentialConfigurationFormats() async throws {
+		let data = try #require(Data(name: "pid-demo-openid-credential-issuer", ext: "json", from: Bundle.module))
+		let metadata = try JSONDecoder().decode(CredentialIssuerMetadata.self, from: data)
+		let service = try makeVciService(storageService: TestDataStorageService())
+		let mdoc = try await service.getCredentialConfiguration(
+			credentialIssuerIdentifier: metadata.credentialIssuerIdentifier.url.absoluteString,
+			issuerDisplay: metadata.display,
+			credentialsSupported: metadata.credentialsSupported,
+			identifier: "pid-mso-mdoc", docType: "eu.europa.ec.eudi.pid.1", vct: nil,
+			batchCredentialIssuance: nil, dpopSigningAlgValuesSupported: nil,
+			clientAttestationPopSigningAlgValuesSupported: nil
+		)
+		#expect(mdoc.format == .cbor)
+		#expect(mdoc.docType == "eu.europa.ec.eudi.pid.1")
+		#expect(mdoc.configurationIdentifier.value == "pid-mso-mdoc")
+
+		let sdJwt = try await service.getCredentialConfiguration(
+			credentialIssuerIdentifier: metadata.credentialIssuerIdentifier.url.absoluteString,
+			issuerDisplay: metadata.display,
+			credentialsSupported: metadata.credentialsSupported,
+			identifier: "pid-sd-jwt", docType: nil, vct: "urn:eudi:pid:de:1",
+			batchCredentialIssuance: nil, dpopSigningAlgValuesSupported: ["ES256"],
+			clientAttestationPopSigningAlgValuesSupported: ["ES384"]
+		)
+		#expect(sdJwt.format == .sdjwt)
+		#expect(sdJwt.vct == "urn:eudi:pid:de:1")
+		#expect(sdJwt.dpopSigningAlgValuesSupported == ["ES256"])
+		#expect(sdJwt.clientAttestationPopSigningAlgValuesSupported == ["ES384"])
+		#expect(sdJwt.credentialSigningAlgValuesSupported.isEmpty == false)
+
+		do {
+			_ = try await service.getCredentialConfiguration(
+				credentialIssuerIdentifier: metadata.credentialIssuerIdentifier.url.absoluteString,
+				issuerDisplay: metadata.display,
+				credentialsSupported: metadata.credentialsSupported,
+				identifier: "missing", docType: nil, vct: nil,
+				batchCredentialIssuance: nil, dpopSigningAlgValuesSupported: nil,
+				clientAttestationPopSigningAlgValuesSupported: nil
+			)
+			Issue.record("An unknown credential configuration should fail")
+		} catch let error as WalletError {
+			#expect(error.code == .invalidQueryResolution)
 		}
 	}
 
@@ -709,7 +789,7 @@ final class TestNetworking: Networking {
 	}
 
 	func data(from url: URL) async throws -> (Data, URLResponse) {
-		let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: [:])!
+		let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!
 		return (metadata, response)
 	}
 

@@ -131,8 +131,8 @@ public final class SdJwtElements: Identifiable, @unchecked Sendable {
 
 extension IssuerSigned {
 	public func extractMsoMdocElements(docId: String, docType: String, displayName: String?, docClaims: [DocClaim], itemsRequested: [NameSpace: [RequestItem]]) -> MsoMdocElements {
-		let itemsReq = if itemsRequested.count > 0 { itemsRequested } else { Dictionary(grouping: docClaims, by: { $0.path.first! }).mapValues { $0.map { RequestItem(elementPath: Array($0.path.dropFirst())) } } }
-		return MsoMdocElements(docId: docId, docType: docType, displayName: displayName, nameSpacedElements: itemsReq.compactMap { ns, requestItems in
+		// A request without items asks for no selectively disclosable claims (OpenID4VP 1.0 section 6.4.1).
+		return MsoMdocElements(docId: docId, docType: docType, displayName: displayName, nameSpacedElements: itemsRequested.compactMap { ns, requestItems in
 			extractNameSpacedElements(docType: docType, ns: ns, docClaims: docClaims, requestItems: requestItems)
 		})
 	}
@@ -150,7 +150,7 @@ extension SignedSDJWT {
 		guard let allPathsDict = (try? recreateClaims())?.disclosuresPerClaimPath else { return nil }
 		let allPaths = OrderedSet(allPathsDict.keys).union(docClaims.flatMap(\.claimPaths))
 		let isMandatory: (RequestItem) -> Bool = { if let o = $0.isOptional { !o } else { false } }
-		let itemsReq = itemsRequested[""] ?? allPaths.map { RequestItem(elementPath: $0.value.map(\.claimName)) }
+		let itemsReq = itemsRequested[""] ?? []
 		let sdJwtArray = Self.buildSdJwtElementTree(itemsReq: itemsReq, allPaths: allPaths, docClaims: docClaims, isMandatory: isMandatory, parentPath: [])
 		return SdJwtElements(docId: docId, vct: vct, displayName: displayName, sdJwtElements: sdJwtArray)
 	}
@@ -205,7 +205,7 @@ extension RequestItem {
 
 	public func extractMsoMdocElement(ns: String, nsItems: [IssuerSignedItem], docClaims: [DocClaim], isMandatory: Bool) -> MsoMdocElement {
 		let issuedElement = nsItems.first { $0.elementIdentifier == rootIdentifier }
-		let stringValue = issuedElement?.description
+		let stringValue = issuedElement?.displayString
 		let docClaim = docClaims.first { $0.namespace == ns && $0.name == rootIdentifier }
 		return MsoMdocElement(elementIdentifier: elementIdentifier, isOptional: !isMandatory, intentToRetain: intentToRetain ?? false, stringValue: stringValue, docClaim: docClaim, isValid: issuedElement != nil)
 	}
@@ -261,7 +261,8 @@ extension Array where Element == DocElements {
 }
 
 extension ClaimPath {
- 	public func contains2(_ that: ClaimPath) -> Bool { zip(self.value, that.value).allSatisfy { (selfElement, thatElement) in selfElement.contains(thatElement) } }
+ 	/// True when `that` is this path or a path below it. A longer path never contains a shorter path.
+ 	public func contains2(_ that: ClaimPath) -> Bool { self.value.count <= that.value.count && zip(self.value, that.value).allSatisfy { (selfElement, thatElement) in selfElement.contains(thatElement) } }
 }
 
 public final class NameSpacedElements: Identifiable, @unchecked Sendable {
